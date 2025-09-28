@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package io.chronicle.proto.ext.v1;
+
+
+enum StatusCode {
+  OK = 0;
+  INVALID_TERM = 1;
+  FENCED = 2;
+}
+
+// control commands
+message FenceRequest {
+  int64 timeline_id = 1;
+  int64 term = 2;
+}
+
+message FenceResponse {
+  StatusCode code = 1;
+  int64 lra = 2;
+  int64 term = 3;
+}
+
+
+message Event {
+  int64 timeline_id = 1;
+  int64 term = 2;
+  int64 offset = 3;
+  optional bytes payload = 4;
+  optional uint32 crc32 = 5;
+  int64 timestamp = 6;
+}
+
+message FetchEventsRequest {
+  int64 timeline_id = 1;
+  int64 start_offset = 2;
+  int64 end_offset = 3;
+}
+
+enum ChunkType {
+  FULL = 0;
+  FIRST = 1;
+  MIDDLE = 2;
+  LAST = 3;
+}
+
+// streaming
+message FetchEventsResponse {
+  StatusCode code = 1;
+  ChunkType type = 2;
+  int64 timeline_id = 3;
+  repeated Event event = 4;
+  int64 advanced_offset = 5;
+}
+
+// batching operations
+message RecordEventsRequest {
+  repeated RecordEventsRequestItem items = 1;
+}
+
+message RecordEventsResponse {
+  repeated RecordEventsResponseItem items = 1;
+}
+message RecordEventsRequestItem {
+  Event event = 1;
+  bool trunc = 2;
+  int64 lra = 3;
+}
+
+message RecordEventsResponseItem {
+  StatusCode code = 1;
+  Event event = 2;
+}
+
+service Chronicle {
+  rpc Record(stream RecordEventsRequest) returns (stream RecordEventsResponse);
+  rpc Fetch(stream FetchEventsRequest) returns (stream FetchEventsResponse);
+  rpc Fence(FenceRequest) returns (FenceResponse);
+}

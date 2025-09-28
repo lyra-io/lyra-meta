@@ -1,0 +1,135 @@
+syntax = "proto3";
+
+package io.chronicle.proto.logic.v1;
+
+enum CompatibilityMode {
+  NONE = 0;
+  BACKWARD = 1;
+  FORWARD = 2;
+  FULL = 3;
+}
+
+enum SchemaType {
+  // Schema formats
+  JSON = 0;
+  PROTOBUF = 1;
+  AVRO = 2;
+
+  // Arrow primitive types
+  NULL = 3;
+  BOOLEAN = 4;
+  INT8 = 5;
+  INT16 = 6;
+  INT32 = 7;
+  INT64 = 8;
+  UINT8 = 9;
+  UINT16 = 10;
+  UINT32 = 11;
+  UINT64 = 12;
+  FLOAT16 = 13;
+  FLOAT32 = 14;
+  FLOAT64 = 15;
+
+  // Arrow decimal types (definition: {"precision": u8, "scale": i8})
+  DECIMAL128 = 16;
+  DECIMAL256 = 17;
+
+  // Arrow temporal types
+  DATE32 = 18;
+  DATE64 = 19;
+  TIME32 = 20;    // definition: {"unit": "SECOND"|"MILLISECOND"}
+  TIME64 = 21;    // definition: {"unit": "MICROSECOND"|"NANOSECOND"}
+  TIMESTAMP = 22; // definition: {"unit": "...", "timezone": "..."}
+  DURATION = 23;  // definition: {"unit": "..."}
+  INTERVAL = 24;  // definition: {"unit": "YEAR_MONTH"|"DAY_TIME"|"MONTH_DAY_NANO"}
+
+  // Arrow binary types
+  BINARY = 25;
+  LARGE_BINARY = 26;
+  FIXED_SIZE_BINARY = 27; // definition: {"byte_width": i32}
+
+  // Arrow string types
+  UTF8 = 28;
+  LARGE_UTF8 = 29;
+
+  // Arrow nested types (structure in definition)
+  LIST = 30;
+  LARGE_LIST = 31;
+  FIXED_SIZE_LIST = 32; // definition: {"list_size": i32, ...}
+  STRUCT = 33;
+  MAP = 34;
+  UNION = 35;
+}
+
+message Schema {
+  string name = 1;
+  int32 version = 2;
+  SchemaType schema_type = 3;
+  string definition = 4;
+  CompatibilityMode compatibility = 5;
+  int64 created_at = 6;
+  string description = 7;
+}
+
+message CreateSchemaRequest {
+  string name = 1;
+  SchemaType schema_type = 2;
+  string definition = 3;
+  CompatibilityMode compatibility = 4;
+  string description = 5;
+}
+
+message CreateSchemaResponse {
+  Schema schema = 1;
+}
+
+message GetSchemaRequest {
+  string name = 1;
+  optional int32 version = 2;
+}
+
+message GetSchemaResponse {
+  Schema schema = 1;
+}
+
+message UpdateSchemaRequest {
+  string name = 1;
+  string definition = 2;
+  optional CompatibilityMode compatibility = 3;
+  optional string description = 4;
+}
+
+message UpdateSchemaResponse {
+  Schema schema = 1;
+}
+
+message DeleteSchemaRequest {
+  string name = 1;
+}
+
+message DeleteSchemaResponse {}
+
+message ListSchemasRequest {}
+
+message ListSchemasResponse {
+  repeated Schema schemas = 1;
+}
+
+message CheckCompatibilityRequest {
+  string name = 1;
+  string definition = 2;
+}
+
+message CheckCompatibilityResponse {
+  bool compatible = 1;
+  string message = 2;
+}
+
+service SchemaRegistry {
+  rpc CreateSchema(CreateSchemaRequest) returns (CreateSchemaResponse);
+  rpc GetSchema(GetSchemaRequest) returns (GetSchemaResponse);
+  rpc UpdateSchema(UpdateSchemaRequest) returns (UpdateSchemaResponse);
+  rpc DeleteSchema(DeleteSchemaRequest) returns (DeleteSchemaResponse);
+  rpc ListSchemas(ListSchemasRequest) returns (ListSchemasResponse);
+  rpc CheckCompatibility(CheckCompatibilityRequest) returns (CheckCompatibilityResponse);
+}
