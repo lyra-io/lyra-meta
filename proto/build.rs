@@ -11,7 +11,6 @@ fn main() {
                 "pb_external.proto",
                 "pb_storage.proto",
                 "pb_catalog.proto",
-                "pb_logic.proto",
                 "pb_admin.proto",
             ],
             &[""],

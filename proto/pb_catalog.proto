@@ -32,3 +32,7 @@ message UnitRegistration {
   string address = 1;
   UnitStatus status = 2;
 }
+
+message UnitRegistry {
+  repeated UnitRegistration units = 1;
+}

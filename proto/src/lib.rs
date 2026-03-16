@@ -7,9 +7,6 @@ pub mod pb_storage {
 pub mod pb_catalog {
     tonic::include_proto!("io.chronicle.proto.catalog.v1");
 }
-pub mod pb_logic {
-    tonic::include_proto!("io.chronicle.proto.logic.v1");
-}
 pub mod pb_admin {
     tonic::include_proto!("io.chronicle.proto.admin.v1");
 }
