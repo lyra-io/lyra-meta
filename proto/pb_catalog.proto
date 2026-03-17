@@ -2,25 +2,23 @@ syntax = "proto3";
 
 package io.chronicle.proto.catalog.v1;
 
+message TimelineMeta {
+  string name = 1;
+  int64 timeline_id = 2;
+  TimelineStatus status = 3;
+  int64 term = 4;
+  int64 version = 5;
+  int64 lra = 6;
+}
+
 message Segment {
-  int64 id = 1;
-  repeated string ensemble = 2;
-  int64 start_offset = 3;
+  repeated string ensemble = 1;
+  int64 start_offset = 2;
 }
 
 enum TimelineStatus {
   ACTIVE = 0;
   SEALED = 1;
-}
-
-message TimelineCatalog {
-  string name = 1;
-  int64 timeline_id = 2;
-  TimelineStatus status = 3;
-  repeated Segment segments = 4;
-  int64 term = 5;
-  int64 version = 6;
-  int64 lra = 7;
 }
 
 enum UnitStatus {
