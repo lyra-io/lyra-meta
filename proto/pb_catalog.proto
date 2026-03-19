@@ -32,6 +32,5 @@ message UnitRegistration {
   string zone = 3;
 }
 
-message UnitRegistry {
-  repeated UnitRegistration units = 1;
-}
+// UnitRegistry removed — units are now stored as individual keys
+// at /chronicle/units/{zone}/{unit-id}
