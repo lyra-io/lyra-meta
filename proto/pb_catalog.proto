@@ -29,6 +29,7 @@ enum UnitStatus {
 message UnitRegistration {
   string address = 1;
   UnitStatus status = 2;
+  string zone = 3;
 }
 
 message UnitRegistry {
