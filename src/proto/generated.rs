@@ -1,7 +1,3 @@
-pub mod pb_ext {
-    tonic::include_proto!("io.lyra.proto.ext.v1");
-}
-
 pub mod pb_catalog {
-    tonic::include_proto!("io.lyra.proto.catalog.v1");
+    include!(concat!(env!("OUT_DIR"), "/io.lyra.proto.catalog.v1.rs"));
 }

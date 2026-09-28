@@ -1,7 +1,7 @@
-use meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
-use meta::metadata::{Metadata, MetadataPutCondition};
-use meta::proto::pb_catalog::{Connection, Database, Schema, Secret, SecretRef, User};
-use meta::utils::scram::make_scram_value;
+use lyra_meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
+use lyra_meta::metadata::{Metadata, MetadataPutCondition};
+use lyra_meta::proto::pb_catalog::{Connection, Database, Schema, Secret, SecretRef, User};
+use lyra_meta::utils::scram::make_scram_value;
 use std::collections::HashMap;
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};

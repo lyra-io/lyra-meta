@@ -1,22 +1,23 @@
 [package]
-name = "meta"
+name = "lyra-meta"
 version = "0.1.0"
 edition = "2024"
-resolver = "3"
+license = "Apache-2.0"
+repository = "https://github.com/lyra-io/lyra-meta"
+description = "Shared Lyra contracts: catalog types, authentication, metadata and common utilities."
 
 [dependencies]
-async-trait = { workspace = true }
-futures-util = { workspace = true }
-libc = { workspace = true }
-oxia-client = { workspace = true }
-tonic = { workspace = true }
-prost = { workspace = true }
-rand = { workspace = true }
-ring = { workspace = true }
-stringprep = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
+async-trait = "0.1"
+futures-util = "0.3"
+libc = "0.2"
+oxia-client = "0.1.0"
+prost = "0.13"
+rand = "0.9"
+ring = "0.17.14"
+stringprep = "0.1.5"
+thiserror = "2.0.12"
+tokio = { version = "1.47", features = ["full"] }
+tracing = "0.1"
 
 [build-dependencies]
-tonic-build = { workspace = true }
 prost-build = "0.13.5"
