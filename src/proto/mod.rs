@@ -1,3 +1,4 @@
+mod database;
 mod generated;
 mod redacted;
 

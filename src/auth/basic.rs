@@ -1,7 +1,7 @@
 use crate::auth::{AuthenticatedUser, AuthenticationError, AuthenticationProvider, Result};
 use crate::metadata::Metadata;
-use crate::proto::pb_catalog::Scram;
-use crate::utils::scram::{as_scram, is_valid_scram, verify_scram};
+use crate::proto::pb_meta::ScramSha256Verifier;
+use crate::utils::verifier::verify_verifier;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -14,19 +14,10 @@ impl BasicAuthenticationProvider {
     pub fn new(metadata: Arc<dyn Metadata>) -> Self {
         Self { metadata }
     }
-
-    pub async fn scram(&self, name: &str) -> Result<Scram> {
-        let user = self
-            .metadata
-            .get_user(name)
+    pub async fn scram(&self, name: &str) -> Result<ScramSha256Verifier> {
+        self.metadata
+            .user_verifier(name)
             .await?
-            .ok_or(AuthenticationError::InvalidCredentials)?;
-        user.value()
-            .password
-            .as_ref()
-            .and_then(as_scram)
-            .filter(|scram| is_valid_scram(scram))
-            .cloned()
             .ok_or(AuthenticationError::InvalidCredentials)
     }
 }
@@ -39,46 +30,37 @@ impl AuthenticationProvider for BasicAuthenticationProvider {
             .get_user(name)
             .await?
             .ok_or(AuthenticationError::InvalidCredentials)?;
-        let credential = user
-            .value()
-            .password
-            .as_ref()
-            .and_then(as_scram)
-            .ok_or(AuthenticationError::InvalidCredentials)?;
-        if !is_valid_scram(credential) || !verify_scram(password, credential) {
+        let credential = self.scram(name).await?;
+        if !verify_verifier(password, &credential) {
             return Err(AuthenticationError::InvalidCredentials);
         }
-        Ok(AuthenticatedUser::new(user.value().name.clone()))
+        Ok(AuthenticatedUser::new(user.id(), user.value().name.clone()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::{MemoryMetadata, MetadataPutCondition};
-    use crate::proto::pb_catalog::User;
-    use crate::utils::scram::make_scram_value;
+    use crate::metadata::MemoryMetadata;
+    use crate::utils::verifier::make_verifier;
 
     #[tokio::test]
-    async fn authenticates_a_catalog_user() {
+    async fn authenticates_existing_user_identity() {
         let metadata = Arc::new(MemoryMetadata::new());
         metadata
-            .put_user(
-                User {
-                    name: "alice".to_string(),
-                    password: Some(make_scram_value("s3cr3t")),
-                },
-                MetadataPutCondition::NotExists,
-            )
+            .initialize(make_verifier("secret").unwrap())
             .await
             .unwrap();
         let provider = BasicAuthenticationProvider::new(metadata);
-
-        let user = provider.authenticate("alice", "s3cr3t").await.unwrap();
-
-        assert_eq!(user.name(), "alice");
+        let user = provider.authenticate("lyrasys", "secret").await.unwrap();
+        assert_eq!(user.id(), 1);
+        assert_eq!(user.name(), "lyrasys");
         assert!(matches!(
-            provider.authenticate("alice", "wrong").await,
+            provider.authenticate("lyrasys", "wrong").await,
+            Err(AuthenticationError::InvalidCredentials)
+        ));
+        assert!(matches!(
+            provider.authenticate("unknown", "secret").await,
             Err(AuthenticationError::InvalidCredentials)
         ));
     }

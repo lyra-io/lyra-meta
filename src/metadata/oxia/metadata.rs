@@ -1,394 +1,298 @@
-use crate::metadata::oxia::OxiaOptions;
-use crate::metadata::oxia::keyspace::Keyspace;
-use crate::metadata::path::{
-    CONNECTION_PATH, DATABASE_PATH, SCHEMA_PATH, SECRET_PATH, USER_PARTITION_KEY, USER_PATH,
-};
+use super::OxiaOptions;
+use crate::metadata::engine::{Engine, metadata_impl};
+use crate::metadata::keys::validate_component as super_validate_component;
+use crate::metadata::keys::{PARTITION, registration_key, validate_component};
+use crate::metadata::registration::Lease;
+use crate::metadata::storage::{Condition, Row, Storage};
 use crate::metadata::{
-    Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
-    validate_user,
+    ComponentIdentity, Metadata, MetadataError, MetadataRecord, MetadataVersion, Registration,
+    Result, UserInfo,
 };
-use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, User};
+use crate::proto::pb_meta::{ComponentRegistration, Database, Instance, ScramSha256Verifier, User};
 use async_trait::async_trait;
-use futures_util::future::try_join_all;
-use oxia::{OxiaClient, OxiaError};
+use opentelemetry::metrics::Meter;
+use oxia::{GetResult, OxiaClient, OxiaError};
 use prost::Message;
+use std::sync::Arc;
+use uuid::Uuid;
 
 pub struct OxiaMetadata {
     // Immutable state
-    client: OxiaClient,
-    keyspace: Keyspace,
+    engine: Engine,
 }
 
 impl OxiaMetadata {
     pub async fn new(options: &OxiaOptions) -> Result<Self> {
-        let keyspace = Keyspace::new();
-        let client = OxiaClient::builder()
-            .service_address(options.service_address())
-            .namespace(options.namespace())
-            .build()
-            .await?;
-
-        Ok(Self { client, keyspace })
+        Self::new0(options, None).await
     }
-
-    fn write_error(key: &str, error: OxiaError) -> MetadataError {
-        match error {
-            OxiaError::UnexpectedVersionId => MetadataError::Conflict(key.to_string()),
-            error => MetadataError::Oxia(error),
-        }
+    pub async fn with_meter(options: &OxiaOptions, meter: Meter) -> Result<Self> {
+        Self::new0(options, Some(meter)).await
     }
-
-    fn schema_path0(&self, database: &str) -> Result<String> {
-        self.keyspace
-            .collection(DATABASE_PATH, database, SCHEMA_PATH)
+    async fn new0(options: &OxiaOptions, meter: Option<Meter>) -> Result<Self> {
+        let client = connect(options).await?;
+        Ok(Self {
+            engine: Engine::new(
+                Arc::new(OxiaStorage {
+                    client,
+                    options: options.clone(),
+                }),
+                meter,
+            ),
+        })
     }
+}
 
-    fn object_path0(&self, database: &str, schema: &str, path: &str) -> Result<String> {
-        self.keyspace
-            .collection(&self.schema_path0(database)?, schema, path)
+struct OxiaStorage {
+    // Immutable state
+    client: OxiaClient,
+    options: OxiaOptions,
+}
+
+fn row0(record: GetResult) -> Row {
+    Row {
+        key: record.key,
+        value: record.value.unwrap_or_default().to_vec(),
+        version: record.version.version_id,
     }
+}
 
-    async fn get0<T>(
-        &self,
-        key: &str,
-        partition_key: Option<&str>,
-    ) -> Result<Option<MetadataRecord<T>>>
-    where
-        T: Message + Default,
-    {
-        let request = self.client.get(key);
-        let result = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key).await,
-            None => request.await,
-        };
-        match result {
-            Ok(record) => {
-                let value = T::decode(record.value.unwrap_or_default())?;
-                let version = MetadataVersion::new(record.version.version_id);
-                Ok(Some(MetadataRecord::new(value, version)))
-            }
-            Err(OxiaError::KeyNotFound) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+fn error0(error: OxiaError) -> MetadataError {
+    match error {
+        OxiaError::UnexpectedVersionId => MetadataError::Conflict("backend version".into()),
+        OxiaError::KeyNotFound => MetadataError::NotFound,
+        OxiaError::Closed => MetadataError::Closed,
+        error => MetadataError::Oxia(error),
     }
+}
 
-    async fn put0<T>(
-        &self,
-        key: &str,
-        value: &T,
-        condition: MetadataPutCondition,
-        partition_key: Option<&str>,
-    ) -> Result<MetadataVersion>
-    where
-        T: Message,
-    {
-        let request = self.client.put(key, value.encode_to_vec());
-        let request = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key),
-            None => request,
-        };
-        let result = match condition {
-            MetadataPutCondition::Unconditional => request.await,
-            MetadataPutCondition::NotExists => request.expected_record_not_exists().await,
-            MetadataPutCondition::Version(version) => {
-                request.expected_version_id(version.value()).await
-            }
-        }
-        .map_err(|error| Self::write_error(key, error))?;
-
-        Ok(MetadataVersion::new(result.version.version_id))
+async fn connect(options: &OxiaOptions) -> Result<OxiaClient> {
+    if options.namespace().is_empty() || options.service_address().is_empty() {
+        return Err(MetadataError::InvalidRecord(
+            "metadata endpoint and namespace are required",
+        ));
     }
-
-    async fn delete0(
-        &self,
-        key: &str,
-        expected_version: Option<MetadataVersion>,
-        partition_key: Option<&str>,
-    ) -> Result<()> {
-        let request = self.client.delete(key);
-        let request = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key),
-            None => request,
-        };
-        let result = match expected_version {
-            Some(version) => request.expected_version_id(version.value()).await,
-            None => request.await,
-        };
-        result.map_err(|error| Self::write_error(key, error))?;
-        Ok(())
-    }
-
-    async fn scan0<T>(
-        &self,
-        prefix: &str,
-        partition_key: Option<&str>,
-    ) -> Result<Vec<MetadataRecord<T>>>
-    where
-        T: Message + Default,
-    {
-        let (first, last) = self.keyspace.range(prefix)?;
-        let request = self.client.range_scan(first, last);
-        let records = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key).await?,
-            None => request.await?,
-        };
-        records
-            .into_iter()
-            .map(|record| {
-                let value = T::decode(record.value.unwrap_or_default())?;
-                let version = MetadataVersion::new(record.version.version_id);
-                Ok(MetadataRecord::new(value, version))
-            })
-            .collect()
-    }
-
-    async fn scan_direct0<T>(
-        &self,
-        prefix: &str,
-        partition_key: Option<&str>,
-    ) -> Result<Vec<MetadataRecord<T>>>
-    where
-        T: Message + Default,
-    {
-        let (first, last) = self.keyspace.range(prefix)?;
-        let request = self.client.range_scan(first, last);
-        let records = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key).await?,
-            None => request.await?,
-        };
-        records
-            .into_iter()
-            .filter(|record| {
-                record
-                    .key
-                    .strip_prefix(prefix)
-                    .is_some_and(|name| !name.contains('/'))
-            })
-            .map(|record| {
-                let value = T::decode(record.value.unwrap_or_default())?;
-                let version = MetadataVersion::new(record.version.version_id);
-                Ok(MetadataRecord::new(value, version))
-            })
-            .collect()
-    }
+    Ok(OxiaClient::builder()
+        .service_address(options.service_address())
+        .namespace(options.namespace())
+        .request_timeout(options.request_timeout())
+        .session_timeout(options.session_timeout())
+        .session_keep_alive(options.session_timeout() / 10)
+        .build()
+        .await?)
 }
 
 #[async_trait]
-impl Metadata for OxiaMetadata {
-    async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>> {
-        let key = self.keyspace.object(USER_PATH, name)?;
-        self.get0(&key, Some(USER_PARTITION_KEY)).await
+impl Storage for OxiaStorage {
+    fn backend(&self) -> &'static str {
+        "oxia"
     }
-
-    async fn put_user(
-        &self,
-        user: User,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        validate_user(&user)?;
-        let key = self.keyspace.object(USER_PATH, &user.name)?;
-        self.put0(&key, &user, condition, Some(USER_PARTITION_KEY))
+    async fn get(&self, key: &str) -> Result<Option<Row>> {
+        match self.client.get(key).partition_key(PARTITION).await {
+            Ok(record) => Ok(Some(row0(record))),
+            Err(OxiaError::KeyNotFound) => Ok(None),
+            Err(error) => Err(error0(error)),
+        }
+    }
+    async fn scan(&self, first: &str, last: &str) -> Result<Vec<Row>> {
+        Ok(self
+            .client
+            .range_scan(first, last)
+            .partition_key(PARTITION)
+            .await?
+            .into_iter()
+            .map(row0)
+            .collect())
+    }
+    async fn find(&self, index: &str, name: &str) -> Result<Vec<Row>> {
+        let first = match self
+            .client
+            .get(name)
+            .partition_key(PARTITION)
+            .use_index(index)
             .await
+        {
+            Ok(row) => row,
+            Err(OxiaError::KeyNotFound) => return Ok(Vec::new()),
+            Err(error) => return Err(error0(error)),
+        };
+        // A bounded prefix range captures every exact match (not just Get's first
+        // match). Filter the secondary key, so neighboring/prefix names cannot
+        // be mistaken for duplicates. The end is a valid UTF-8 upper suffix.
+        let end = format!("{name}\u{10ffff}");
+        let records = self
+            .client
+            .range_scan(name, end)
+            .partition_key(PARTITION)
+            .use_index(index)
+            .await?;
+        // Oxia RangeScan does not populate secondary_index_key. The exact Get
+        // establishes the first match; inspect the typed name for the remaining
+        // prefix candidates, and retain the exact match even if its value is
+        // corrupt so the common validation layer can reject it.
+        let mut matches = vec![row0(first)];
+        for record in records {
+            if matches.iter().any(|row| row.key == record.key) {
+                continue;
+            }
+            let value = record.value.as_deref().unwrap_or_default();
+            let actual = match index {
+                "lyra.user.name" => User::decode(value)?.name,
+                "lyra.database.name" => Database::decode(value)?.name,
+                _ => return Err(MetadataError::InvalidRecord("unknown metadata index")),
+            };
+            if actual == name {
+                matches.push(row0(record));
+            }
+        }
+        Ok(matches)
     }
-
-    async fn delete_user(
-        &self,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let key = self.keyspace.object(USER_PATH, name)?;
-        self.delete0(&key, expected_version, Some(USER_PARTITION_KEY))
+    async fn allocate(&self, prefix: &str, value: Vec<u8>, index: &str, name: &str) -> Result<Row> {
+        let record = self
+            .client
+            .put(prefix, value.clone())
+            .partition_key(PARTITION)
+            .sequence_key_deltas([1])
+            .secondary_index(index, name)
             .await
+            .map_err(error0)?;
+        Ok(Row {
+            key: record.key,
+            value,
+            version: record.version.version_id,
+        })
     }
-
-    async fn list_users(&self) -> Result<Vec<MetadataRecord<User>>> {
-        self.scan_direct0(USER_PATH, Some(USER_PARTITION_KEY)).await
-    }
-
-    async fn rename_user(
+    async fn put(
         &self,
-        name: &str,
-        user: User,
-        expected_version: MetadataVersion,
-    ) -> Result<MetadataVersion> {
-        validate_user(&user)?;
-        let old_key = self.keyspace.object(USER_PATH, name)?;
-        let new_key = self.keyspace.object(USER_PATH, &user.name)?;
-        let put = self.put0(
-            &new_key,
-            &user,
-            MetadataPutCondition::NotExists,
-            Some(USER_PARTITION_KEY),
-        );
-        let delete = self.delete0(&old_key, Some(expected_version), Some(USER_PARTITION_KEY));
-        let (version, ()) = tokio::try_join!(put, delete)?;
-        Ok(version)
+        key: &str,
+        value: Vec<u8>,
+        condition: Condition,
+        index: Option<(&str, &str)>,
+    ) -> Result<Row> {
+        let request = self.client.put(key, value.clone()).partition_key(PARTITION);
+        let request = match condition {
+            Condition::Missing => request.expected_record_not_exists(),
+            Condition::Version(version) => request.expected_version_id(version),
+        };
+        let request = match index {
+            Some((index, name)) => request.secondary_index(index, name),
+            None => request,
+        };
+        let result = request.await.map_err(error0)?;
+        Ok(Row {
+            key: result.key,
+            value,
+            version: result.version.version_id,
+        })
     }
-
-    async fn delete_users(&self, users: &[(String, MetadataVersion)]) -> Result<()> {
-        let records = users
-            .iter()
-            .map(|(name, version)| Ok((self.keyspace.object(USER_PATH, name)?, *version)))
-            .collect::<Result<Vec<_>>>()?;
-        try_join_all(
-            records
-                .iter()
-                .map(|(key, version)| self.delete0(key, Some(*version), Some(USER_PARTITION_KEY))),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn get_database(&self, name: &str) -> Result<Option<MetadataRecord<Database>>> {
-        let key = self.keyspace.object(DATABASE_PATH, name)?;
-        self.get0(&key, Some(name)).await
-    }
-
-    async fn put_database(
-        &self,
-        database: Database,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let key = self.keyspace.object(DATABASE_PATH, &database.name)?;
-        self.put0(&key, &database, condition, Some(&database.name))
+    async fn delete(&self, key: &str, version: i64) -> Result<()> {
+        self.client
+            .delete(key)
+            .partition_key(PARTITION)
+            .expected_version_id(version)
             .await
+            .map_err(error0)
     }
-
-    async fn delete_database(
-        &self,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let key = self.keyspace.object(DATABASE_PATH, name)?;
-        self.delete0(&key, expected_version, Some(name)).await
+    async fn register(&self, component: &str) -> Result<(ComponentIdentity, Arc<dyn Lease>)> {
+        validate_component(component)?;
+        let id = Uuid::new_v4();
+        let key = registration_key(component, id)?;
+        let partition = format!("discovery/{component}");
+        // A dedicated SDK instance owns this lease. Closing it cannot close the
+        // durable client's sessions or another registration's session.
+        let client = connect(&self.options).await?;
+        let result = client
+            .put(&key, ComponentRegistration {}.encode_to_vec())
+            .partition_key(&partition)
+            .expected_record_not_exists()
+            .ephemeral()
+            .await;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = client.close().await;
+                return Err(error0(error));
+            }
+        };
+        let identity = ComponentIdentity {
+            component_type: component.into(),
+            registration_id: id,
+        };
+        let lease = OxiaLease {
+            client,
+            key,
+            partition,
+            version: result.version.version_id,
+        };
+        Ok((identity, Arc::new(lease)))
     }
-
-    async fn list_databases(&self) -> Result<Vec<MetadataRecord<Database>>> {
-        self.scan_direct0(DATABASE_PATH, None).await
+    async fn registrations(&self, component: &str) -> Result<Vec<ComponentIdentity>> {
+        validate_component(component)?;
+        let prefix = format!("/discovery/{component}/instances/");
+        let end = format!("{prefix}/");
+        let records = self
+            .client
+            .range_scan(&prefix, end)
+            .partition_key(format!("discovery/{component}"))
+            .await?;
+        records
+            .into_iter()
+            .map(|row| {
+                if !row.version.is_ephemeral() {
+                    return Err(MetadataError::Integrity("durable registration record"));
+                }
+                ComponentRegistration::decode(row.value.unwrap_or_default())?;
+                let suffix = row
+                    .key
+                    .strip_prefix(&prefix)
+                    .ok_or(MetadataError::InvalidRecord(
+                        "registration outside component",
+                    ))?;
+                let id = Uuid::parse_str(suffix)
+                    .map_err(|_| MetadataError::InvalidRecord("invalid registration UUID"))?;
+                if id.to_string() != suffix {
+                    return Err(MetadataError::InvalidRecord(
+                        "non-canonical registration UUID",
+                    ));
+                }
+                Ok(ComponentIdentity {
+                    component_type: component.into(),
+                    registration_id: id,
+                })
+            })
+            .collect()
     }
-
-    async fn get_schema(
-        &self,
-        database: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Schema>>> {
-        let key = self.keyspace.object(&self.schema_path0(database)?, name)?;
-        self.get0(&key, Some(database)).await
-    }
-
-    async fn put_schema(
-        &self,
-        database: &str,
-        schema: Schema,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let key = self
-            .keyspace
-            .object(&self.schema_path0(database)?, &schema.name)?;
-        self.put0(&key, &schema, condition, Some(database)).await
-    }
-
-    async fn delete_schema(
-        &self,
-        database: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let key = self.keyspace.object(&self.schema_path0(database)?, name)?;
-        self.delete0(&key, expected_version, Some(database)).await
-    }
-
-    async fn list_schemas(&self, database: &str) -> Result<Vec<MetadataRecord<Schema>>> {
-        self.scan_direct0(&self.schema_path0(database)?, Some(database))
-            .await
-    }
-
-    async fn get_secret(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Secret>>> {
-        let path = self.object_path0(database, schema, SECRET_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.get0(&key, Some(database)).await
-    }
-
-    async fn put_secret(
-        &self,
-        database: &str,
-        schema: &str,
-        secret: Secret,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let path = self.object_path0(database, schema, SECRET_PATH)?;
-        let key = self.keyspace.object(&path, &secret.name)?;
-        self.put0(&key, &secret, condition, Some(database)).await
-    }
-
-    async fn delete_secret(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let path = self.object_path0(database, schema, SECRET_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version, Some(database)).await
-    }
-
-    async fn list_secrets(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Secret>>> {
-        let path = self.object_path0(database, schema, SECRET_PATH)?;
-        self.scan0(&path, Some(database)).await
-    }
-
-    async fn get_connection(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Connection>>> {
-        let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.get0(&key, Some(database)).await
-    }
-
-    async fn put_connection(
-        &self,
-        database: &str,
-        schema: &str,
-        connection: Connection,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        let key = self.keyspace.object(&path, &connection.name)?;
-        self.put0(&key, &connection, condition, Some(database))
-            .await
-    }
-
-    async fn delete_connection(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version, Some(database)).await
-    }
-
-    async fn list_connections(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Connection>>> {
-        let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        self.scan0(&path, Some(database)).await
+    async fn close(&self) -> Result<()> {
+        self.client.close().await.map_err(error0)
     }
 }
+
+struct OxiaLease {
+    // Immutable state
+    client: OxiaClient,
+    key: String,
+    partition: String,
+    version: i64,
+}
+
+#[async_trait]
+impl Lease for OxiaLease {
+    async fn present(&self) -> Result<bool> {
+        match self
+            .client
+            .get(&self.key)
+            .partition_key(&self.partition)
+            .await
+        {
+            Ok(row) => Ok(row.version.is_ephemeral() && row.version.version_id == self.version),
+            Err(OxiaError::KeyNotFound | OxiaError::Closed) => Ok(false),
+            Err(error) => Err(error0(error)),
+        }
+    }
+    async fn close(&self) -> Result<()> {
+        // Close the owning session, never unconditionally delete a UUID key that
+        // might have been replaced. The SDK/server remove only session-owned keys.
+        self.client.close().await.map_err(error0)
+    }
+}
+
+metadata_impl!(OxiaMetadata);

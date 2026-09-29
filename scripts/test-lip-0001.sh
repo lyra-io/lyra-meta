@@ -63,4 +63,4 @@ if [[ "$ready" != true ]]; then
 fi
 
 OXIA_SERVICE_ADDRESS="127.0.0.1:$test_port" LYRA_MVP_DISPOSABLE=1 \
-  cargo test --locked --test lip_0001 -- --ignored --exact oxia_contract --nocapture
+  cargo test --locked --test metadata_contract -- --ignored --exact oxia_implements_the_metadata_contract --nocapture
