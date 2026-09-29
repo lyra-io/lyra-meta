@@ -64,6 +64,11 @@ impl Engine {
 
     pub(crate) async fn initialize(&self, verifier: ScramSha256Verifier) -> Result<()> {
         validate_verifier(&verifier)?;
+        tracing::info!(
+            event = "initialization_started",
+            operation = "init",
+            "metadata initialization started"
+        );
         let mut blocked = self.mutations.lock().await;
         if *blocked {
             return Err(MetadataError::UncertainWrite);
@@ -71,7 +76,14 @@ impl Engine {
         match self.instance().await? {
             Some(Instance {
                 initialized: Some(true),
-            }) => return Err(MetadataError::AlreadyInitialized),
+            }) => {
+                tracing::info!(
+                    event = "initialization_refused",
+                    outcome = "already_initialized",
+                    "metadata initialization refused without changes"
+                );
+                return Err(MetadataError::AlreadyInitialized);
+            }
             Some(_) => return Err(MetadataError::IncompleteInitialization),
             None => {}
         }
@@ -507,7 +519,10 @@ impl Engine {
         {
             Ok(row) => row,
             Err(_) => match self.unique0(kind, name).await {
-                Ok(Some(row)) if row.value == value => row,
+                Ok(Some(row)) if row.value == value => {
+                    self.metrics.reconciled("create");
+                    row
+                }
                 _ => {
                     *blocked = true;
                     return Err(MetadataError::UncertainWrite);
@@ -561,6 +576,7 @@ impl Engine {
             }
             Err(_) => match self.store.get(key).await {
                 Ok(Some(row)) if row.value == value && row.version != version => {
+                    self.metrics.reconciled("update");
                     *blocked = false;
                     Ok(row)
                 }
@@ -584,6 +600,7 @@ impl Engine {
             }
             Err(_) => match self.store.get(key).await {
                 Ok(None) => {
+                    self.metrics.reconciled("delete");
                     *blocked = false;
                     Ok(())
                 }

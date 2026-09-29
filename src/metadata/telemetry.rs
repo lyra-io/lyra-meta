@@ -26,6 +26,10 @@ impl Metrics {
             duration: meter
                 .f64_histogram("lyra_meta_operation_duration_seconds")
                 .with_unit("s")
+                .with_boundaries(vec![
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+                    60.0,
+                ])
                 .build(),
             registrations: meter
                 .u64_counter("lyra_component_registration_operations_total")
@@ -99,6 +103,22 @@ impl Metrics {
             u64::from(present),
             &[KeyValue::new("component_type", component_label(component))],
         );
+    }
+
+    pub(crate) fn reconciled(&self, operation: &'static str) {
+        let mut last = self
+            .last_error_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if last.is_none_or(|last| last.elapsed() >= Duration::from_secs(5)) {
+            tracing::warn!(
+                event = "metadata_write_reconciled",
+                operation,
+                outcome = "confirmed",
+                "metadata reply was lost; write reconciled without retry"
+            );
+            *last = Some(Instant::now());
+        }
     }
 }
 
