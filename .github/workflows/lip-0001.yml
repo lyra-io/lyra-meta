@@ -1,0 +1,37 @@
+name: LIP-0001 validation
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metadata-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Check formatting, lint, and existing tests
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+      - name: Download pinned Oxia release
+        run: |
+          mkdir -p "$RUNNER_TEMP/oxia"
+          curl --fail --location --retry 3 \
+            https://github.com/oxia-db/oxia/releases/download/v0.17.1/oxia-oxia-linux-amd64.tar.gz \
+            --output "$RUNNER_TEMP/oxia/oxia.tar.gz"
+          echo "9d4289e55c3886628ab15b9c1a71d5b066c07c0288f7451aefd85eb49fb5cf80  $RUNNER_TEMP/oxia/oxia.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/oxia/oxia.tar.gz" -C "$RUNNER_TEMP/oxia"
+      - name: Validate against disposable two-shard Oxia
+        env:
+          OXIA_BIN: ${{ runner.temp }}/oxia/bin/oxia
+        run: bash scripts/test-lip-0001.sh

@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package io.lyra.meta.v1;
+
+// /catalog (partition: catalog). Absence is distinct from initialized=false.
+message Instance {
+  optional bool initialized = 1;
+}
+
+// /catalog/databases/x-<20-digit-sequence> (partition: catalog).
+// The nonzero uint32 ID comes from the key, not a duplicated value field.
+message Database {
+  string name = 1;
+  uint32 owner_user_id = 2;
+}
+
+// /catalog/users/x-<20-digit-sequence> (partition: catalog).
+message User {
+  string name = 1;
+  ScramSha256Verifier password_verifier = 2;
+}
+
+// Private authentication material. Never expose through SQL, logs, or metrics.
+message ScramSha256Verifier {
+  bytes salt = 1;
+  uint32 iterations = 2;
+  bytes stored_key = 3;
+  bytes server_key = 4;
+}
+
+// /discovery/<component-type>/instances/<registration-uuid>
+// (partition: discovery/<component-type>). Ephemeral; an empty value is present.
+message ComponentRegistration {}

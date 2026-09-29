@@ -21,3 +21,9 @@ tracing = "0.1"
 
 [build-dependencies]
 prost-build = "0.13.5"
+
+[dev-dependencies]
+opentelemetry = { version = "0.31", default-features = false, features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "testing"] }
+tracing-subscriber = { version = "0.3", features = ["json"] }
+uuid = { version = "1", features = ["v4"] }
