@@ -21,11 +21,11 @@ thiserror = "2.0.12"
 tokio = { version = "1.47", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
-opentelemetry = { version = "0.31", default-features = false, features = ["metrics"] }
+opentelemetry = { version = "0.32", default-features = false, features = ["metrics"] }
 
 [build-dependencies]
 prost-build = "0.13.5"
 
 [dev-dependencies]
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["metrics", "testing"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["metrics", "testing"] }
 tracing-subscriber = { version = "0.3", features = ["json"] }
