@@ -1,4 +1,3 @@
-mod keyspace;
 mod metadata;
 mod options;
 

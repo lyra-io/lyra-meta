@@ -1,447 +1,209 @@
-use crate::metadata::{
-    Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
-    validate_user,
+use super::engine::{Engine, metadata_impl};
+use super::keys::validate_component as super_validate_component;
+use super::keys::{registration_key, validate_component};
+use super::registration::Lease;
+use super::storage::{Condition, Row, Storage};
+use super::{
+    ComponentIdentity, Metadata, MetadataError, MetadataRecord, MetadataVersion, Registration,
+    Result, UserInfo,
 };
-use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, User};
+use crate::proto::pb_meta::{Database, Instance, ScramSha256Verifier};
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::hash::Hash;
-use tokio::sync::RwLock;
-
-type SchemaKey = (String, String);
-type ObjectKey = (String, String, String);
+use opentelemetry::metrics::Meter;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
 #[derive(Default)]
 struct State {
     // Mutable state
-    next_version: i64,
-    users: HashMap<String, MetadataRecord<User>>,
-    databases: HashMap<String, MetadataRecord<Database>>,
-    schemas: HashMap<SchemaKey, MetadataRecord<Schema>>,
-    secrets: HashMap<ObjectKey, MetadataRecord<Secret>>,
-    connections: HashMap<ObjectKey, MetadataRecord<Connection>>,
+    rows: BTreeMap<String, Row>,
+    indexes: HashMap<String, (String, String)>,
+    version: i64,
+    closed: bool,
 }
 
-#[derive(Default)]
-pub struct MemoryMetadata {
+#[derive(Clone, Default)]
+pub(crate) struct MemoryStorage {
     // Mutable state
-    state: RwLock<State>,
+    state: Arc<Mutex<State>>,
+}
+
+pub struct MemoryMetadata {
+    // Immutable state
+    engine: Engine,
 }
 
 impl MemoryMetadata {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            engine: Engine::new(Arc::new(MemoryStorage::default()), None),
+        }
+    }
+    pub fn with_meter(meter: Meter) -> Self {
+        Self {
+            engine: Engine::new(Arc::new(MemoryStorage::default()), Some(meter)),
+        }
     }
 }
 
-fn get0<K, T>(records: &HashMap<K, MetadataRecord<T>>, key: &K) -> Option<MetadataRecord<T>>
-where
-    K: Eq + Hash,
-    T: Clone,
-{
-    records.get(key).cloned()
+impl Default for MemoryMetadata {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-fn put0<K, T>(
-    records: &mut HashMap<K, MetadataRecord<T>>,
-    next_version: &mut i64,
-    key: K,
-    value: T,
-    condition: MetadataPutCondition,
-) -> Result<MetadataVersion>
-where
-    K: Clone + Debug + Eq + Hash,
-{
-    let valid = match condition {
-        MetadataPutCondition::Unconditional => true,
-        MetadataPutCondition::NotExists => !records.contains_key(&key),
-        MetadataPutCondition::Version(version) => records
-            .get(&key)
-            .is_some_and(|record| record.version() == version),
-    };
-    if !valid {
-        return Err(MetadataError::Conflict(format!("{key:?}")));
+fn check0(state: &State) -> Result<()> {
+    if state.closed {
+        Err(MetadataError::Closed)
+    } else {
+        Ok(())
     }
+}
 
-    *next_version = next_version
+fn version0(state: &mut State) -> Result<i64> {
+    state.version = state
+        .version
         .checked_add(1)
-        .ok_or_else(|| MetadataError::CounterExhausted("memory-version".to_string()))?;
-    let version = MetadataVersion::new(*next_version);
-    records.insert(key, MetadataRecord::new(value, version));
-    Ok(version)
-}
-
-fn delete0<K, T>(
-    records: &mut HashMap<K, MetadataRecord<T>>,
-    key: &K,
-    expected_version: Option<MetadataVersion>,
-) -> Result<()>
-where
-    K: Debug + Eq + Hash,
-{
-    let valid = records
-        .get(key)
-        .is_some_and(|record| expected_version.is_none_or(|version| record.version() == version));
-    if !valid {
-        return Err(MetadataError::Conflict(format!("{key:?}")));
-    }
-    records.remove(key);
-    Ok(())
-}
-
-fn list0<K, T>(
-    records: &HashMap<K, MetadataRecord<T>>,
-    include: impl Fn(&K) -> bool,
-) -> Vec<MetadataRecord<T>>
-where
-    K: Eq + Hash,
-    T: Clone,
-{
-    records
-        .iter()
-        .filter(|(key, _)| include(key))
-        .map(|(_, record)| record.clone())
-        .collect()
-}
-
-fn schema_key0(database: &str, name: &str) -> SchemaKey {
-    (database.to_string(), name.to_string())
-}
-
-fn object_key0(database: &str, schema: &str, name: &str) -> ObjectKey {
-    (database.to_string(), schema.to_string(), name.to_string())
+        .ok_or_else(|| MetadataError::CounterExhausted("memory version".into()))?;
+    Ok(state.version)
 }
 
 #[async_trait]
-impl Metadata for MemoryMetadata {
-    async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>> {
-        Ok(get0(&self.state.read().await.users, &name.to_string()))
+impl Storage for MemoryStorage {
+    fn backend(&self) -> &'static str {
+        "memory"
     }
-
-    async fn put_user(
+    async fn get(&self, key: &str) -> Result<Option<Row>> {
+        let state = self.state.lock().await;
+        check0(&state)?;
+        Ok(state.rows.get(key).cloned())
+    }
+    async fn scan(&self, first: &str, _last: &str) -> Result<Vec<Row>> {
+        let state = self.state.lock().await;
+        check0(&state)?;
+        Ok(state
+            .rows
+            .values()
+            .filter(|row| row.key.starts_with(first))
+            .cloned()
+            .collect())
+    }
+    async fn put(
         &self,
-        user: User,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        validate_user(&user)?;
-        let mut state = self.state.write().await;
-        let State {
-            next_version,
-            users,
-            ..
-        } = &mut *state;
-        put0(users, next_version, user.name.clone(), user, condition)
+        key: &str,
+        value: Vec<u8>,
+        condition: Condition,
+        index: Option<(&str, &str)>,
+    ) -> Result<Row> {
+        let mut state = self.state.lock().await;
+        check0(&state)?;
+        let matches = match condition {
+            Condition::Missing => !state.rows.contains_key(key),
+            Condition::Version(version) => state
+                .rows
+                .get(key)
+                .is_some_and(|row| row.version == version),
+        };
+        if !matches {
+            return Err(MetadataError::Conflict("conditional write".into()));
+        }
+        let row = Row {
+            key: key.into(),
+            value,
+            version: version0(&mut state)?,
+        };
+        state.rows.insert(key.into(), row.clone());
+        state.indexes.remove(key);
+        if let Some((index, name)) = index {
+            state
+                .indexes
+                .insert(key.into(), (index.into(), name.into()));
+        }
+        Ok(row)
     }
-
-    async fn delete_user(
-        &self,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        delete0(
-            &mut self.state.write().await.users,
-            &name.to_string(),
-            expected_version,
-        )
+    async fn delete(&self, key: &str, version: i64) -> Result<()> {
+        let mut state = self.state.lock().await;
+        check0(&state)?;
+        if state.rows.get(key).is_none_or(|row| row.version != version) {
+            return Err(MetadataError::Conflict("conditional delete".into()));
+        }
+        state.rows.remove(key);
+        state.indexes.remove(key);
+        Ok(())
     }
-
-    async fn list_users(&self) -> Result<Vec<MetadataRecord<User>>> {
-        Ok(list0(&self.state.read().await.users, |_| true))
+    async fn register(&self, component: &str) -> Result<(ComponentIdentity, Arc<dyn Lease>)> {
+        validate_component(component)?;
+        let id = Uuid::new_v4();
+        let key = registration_key(component, id)?;
+        let row = self.put(&key, Vec::new(), Condition::Missing, None).await?;
+        let identity = ComponentIdentity {
+            component_type: component.into(),
+            registration_id: id,
+        };
+        let lease = MemoryLease {
+            storage: self.clone(),
+            key,
+            version: row.version,
+        };
+        Ok((identity, Arc::new(lease)))
     }
+    async fn registrations(&self, component: &str) -> Result<Vec<ComponentIdentity>> {
+        validate_component(component)?;
+        let prefix = format!("/discovery/{component}/instances/");
+        let state = self.state.lock().await;
+        check0(&state)?;
+        state
+            .rows
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .map(|key| {
+                let suffix = key.strip_prefix(&prefix).unwrap();
+                let id = Uuid::parse_str(suffix)
+                    .map_err(|_| MetadataError::InvalidRecord("invalid registration UUID"))?;
+                Ok(ComponentIdentity {
+                    component_type: component.into(),
+                    registration_id: id,
+                })
+            })
+            .collect()
+    }
+    async fn close(&self) -> Result<()> {
+        let mut state = self.state.lock().await;
+        state.rows.retain(|key, _| !key.starts_with("/discovery/"));
+        state.closed = true;
+        Ok(())
+    }
+}
 
-    async fn rename_user(
-        &self,
-        name: &str,
-        user: User,
-        expected_version: MetadataVersion,
-    ) -> Result<MetadataVersion> {
-        validate_user(&user)?;
-        let mut state = self.state.write().await;
-        let old_name = name.to_string();
-        if state.users.contains_key(&user.name)
-            || !state
-                .users
-                .get(&old_name)
-                .is_some_and(|record| record.version() == expected_version)
+struct MemoryLease {
+    // Immutable state
+    storage: MemoryStorage,
+    key: String,
+    version: i64,
+}
+
+#[async_trait]
+impl Lease for MemoryLease {
+    async fn present(&self) -> Result<bool> {
+        Ok(self
+            .storage
+            .get(&self.key)
+            .await?
+            .is_some_and(|row| row.version == self.version))
+    }
+    async fn close(&self) -> Result<()> {
+        let mut state = self.storage.state.lock().await;
+        if state
+            .rows
+            .get(&self.key)
+            .is_some_and(|row| row.version == self.version)
         {
-            return Err(MetadataError::Conflict(old_name));
-        }
-        let State {
-            next_version,
-            users,
-            ..
-        } = &mut *state;
-        let version = put0(
-            users,
-            next_version,
-            user.name.clone(),
-            user,
-            MetadataPutCondition::NotExists,
-        )?;
-        users.remove(&old_name);
-        Ok(version)
-    }
-
-    async fn delete_users(&self, users: &[(String, MetadataVersion)]) -> Result<()> {
-        let mut state = self.state.write().await;
-        if let Some((name, _)) = users.iter().find(|(name, version)| {
-            !state
-                .users
-                .get(name)
-                .is_some_and(|record| record.version() == *version)
-        }) {
-            return Err(MetadataError::Conflict(name.clone()));
-        }
-        for (name, _) in users {
-            state.users.remove(name);
+            state.rows.remove(&self.key);
         }
         Ok(())
     }
-
-    async fn get_database(&self, name: &str) -> Result<Option<MetadataRecord<Database>>> {
-        Ok(get0(&self.state.read().await.databases, &name.to_string()))
-    }
-
-    async fn put_database(
-        &self,
-        database: Database,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let mut state = self.state.write().await;
-        let State {
-            next_version,
-            databases,
-            ..
-        } = &mut *state;
-        put0(
-            databases,
-            next_version,
-            database.name.clone(),
-            database,
-            condition,
-        )
-    }
-
-    async fn delete_database(
-        &self,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        delete0(
-            &mut self.state.write().await.databases,
-            &name.to_string(),
-            expected_version,
-        )
-    }
-
-    async fn list_databases(&self) -> Result<Vec<MetadataRecord<Database>>> {
-        Ok(list0(&self.state.read().await.databases, |_| true))
-    }
-
-    async fn get_schema(
-        &self,
-        database: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Schema>>> {
-        Ok(get0(
-            &self.state.read().await.schemas,
-            &schema_key0(database, name),
-        ))
-    }
-
-    async fn put_schema(
-        &self,
-        database: &str,
-        schema: Schema,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let mut state = self.state.write().await;
-        let State {
-            next_version,
-            schemas,
-            ..
-        } = &mut *state;
-        put0(
-            schemas,
-            next_version,
-            schema_key0(database, &schema.name),
-            schema,
-            condition,
-        )
-    }
-
-    async fn delete_schema(
-        &self,
-        database: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        delete0(
-            &mut self.state.write().await.schemas,
-            &schema_key0(database, name),
-            expected_version,
-        )
-    }
-
-    async fn list_schemas(&self, database: &str) -> Result<Vec<MetadataRecord<Schema>>> {
-        Ok(list0(&self.state.read().await.schemas, |key| {
-            key.0 == database
-        }))
-    }
-
-    async fn get_secret(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Secret>>> {
-        Ok(get0(
-            &self.state.read().await.secrets,
-            &object_key0(database, schema, name),
-        ))
-    }
-
-    async fn put_secret(
-        &self,
-        database: &str,
-        schema: &str,
-        secret: Secret,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let mut state = self.state.write().await;
-        let State {
-            next_version,
-            secrets,
-            ..
-        } = &mut *state;
-        put0(
-            secrets,
-            next_version,
-            object_key0(database, schema, &secret.name),
-            secret,
-            condition,
-        )
-    }
-
-    async fn delete_secret(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        delete0(
-            &mut self.state.write().await.secrets,
-            &object_key0(database, schema, name),
-            expected_version,
-        )
-    }
-
-    async fn list_secrets(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Secret>>> {
-        Ok(list0(&self.state.read().await.secrets, |key| {
-            key.0 == database && key.1 == schema
-        }))
-    }
-
-    async fn get_connection(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Connection>>> {
-        Ok(get0(
-            &self.state.read().await.connections,
-            &object_key0(database, schema, name),
-        ))
-    }
-
-    async fn put_connection(
-        &self,
-        database: &str,
-        schema: &str,
-        connection: Connection,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let mut state = self.state.write().await;
-        let State {
-            next_version,
-            connections,
-            ..
-        } = &mut *state;
-        put0(
-            connections,
-            next_version,
-            object_key0(database, schema, &connection.name),
-            connection,
-            condition,
-        )
-    }
-
-    async fn delete_connection(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        delete0(
-            &mut self.state.write().await.connections,
-            &object_key0(database, schema, name),
-            expected_version,
-        )
-    }
-
-    async fn list_connections(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Connection>>> {
-        Ok(list0(&self.state.read().await.connections, |key| {
-            key.0 == database && key.1 == schema
-        }))
-    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn user(name: &str) -> User {
-        User {
-            name: name.to_string(),
-            ..User::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn atomically_renames_and_deletes_users() {
-        let metadata = MemoryMetadata::new();
-        let alice_version = metadata
-            .put_user(user("alice"), MetadataPutCondition::NotExists)
-            .await
-            .unwrap();
-        let bob_version = metadata
-            .put_user(user("bob"), MetadataPutCondition::NotExists)
-            .await
-            .unwrap();
-
-        let admin_version = metadata
-            .rename_user("alice", user("admin"), alice_version)
-            .await
-            .unwrap();
-        metadata
-            .delete_users(&[
-                ("admin".to_string(), admin_version),
-                ("bob".to_string(), bob_version),
-            ])
-            .await
-            .unwrap();
-
-        assert!(metadata.list_users().await.unwrap().is_empty());
-    }
-}
+metadata_impl!(MemoryMetadata);
