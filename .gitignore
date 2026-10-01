@@ -27,7 +27,8 @@ tla+/states/
 tla+/.tools
 
 # Claude Code
-CLAUDE.md
+!CLAUDE.md
 
 
 lyra-unit.pid
+vendor/pprof/Cargo.lock

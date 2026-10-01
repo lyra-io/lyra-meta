@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1
+FROM rust:1.92-slim-bookworm AS validation
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler pkg-config libssl-dev clang cmake git jq && rm -rf /var/lib/apt/lists/*
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+WORKDIR /src
+ENV RUSTFLAGS="--cfg tokio_unstable -C force-frame-pointers=yes" \
+    CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_OPT_LEVEL=1
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry --mount=type=cache,target=/src/target \
+    cargo test --locked --release --all-features && \
+    CARGO_TARGET_DIR=/src/target cargo test --manifest-path vendor/pprof/Cargo.toml --release --features prost-codec lyra_spill_cap && \
+    cargo test --locked --release --all-features --test oxia_metadata --no-run --message-format=json \
+      | jq -r 'select(.profile.test == true and .target.name == "oxia_metadata") | .executable' \
+      | xargs -I TEST_BINARY install -m 0755 TEST_BINARY /usr/local/bin/meta-oxia-test && \
+    strip --strip-debug /usr/local/bin/meta-oxia-test
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=validation /usr/local/bin/meta-oxia-test /usr/local/bin/meta-oxia-test
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/meta-oxia-test"]
+CMD ["--ignored", "--nocapture"]

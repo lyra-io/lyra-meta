@@ -1,394 +1,227 @@
-use crate::metadata::oxia::OxiaOptions;
-use crate::metadata::oxia::keyspace::Keyspace;
-use crate::metadata::path::{
-    CONNECTION_PATH, DATABASE_PATH, SCHEMA_PATH, SECRET_PATH, USER_PARTITION_KEY, USER_PATH,
-};
-use crate::metadata::{
-    Metadata, MetadataError, MetadataPutCondition, MetadataRecord, MetadataVersion, Result,
-    validate_user,
-};
-use crate::proto::pb_catalog::{Connection, Database, Schema, Secret, User};
+use super::OxiaOptions;
+use crate::metadata::engine::{Engine, metadata_impl};
+use crate::metadata::keys::PARTITION;
+use crate::metadata::storage::{Condition, Presence, PresenceEvents, Row, Storage};
+use crate::metadata::{Metadata, MetadataError, MetadataRecord, MetadataVersion, Result, UserInfo};
+use crate::proto::pb_meta::{Component, Database, Instance, ScramSha256Verifier};
 use async_trait::async_trait;
-use futures_util::future::try_join_all;
-use oxia::{OxiaClient, OxiaError};
-use prost::Message;
+use opentelemetry::metrics::Meter;
+use oxia::{GetResult, Notification, Notifications, OxiaClient, OxiaError};
+use std::sync::Arc;
+use uuid::Uuid;
 
 pub struct OxiaMetadata {
     // Immutable state
-    client: OxiaClient,
-    keyspace: Keyspace,
+    engine: Engine,
 }
 
 impl OxiaMetadata {
     pub async fn new(options: &OxiaOptions) -> Result<Self> {
-        let keyspace = Keyspace::new();
-        let client = OxiaClient::builder()
-            .service_address(options.service_address())
-            .namespace(options.namespace())
-            .build()
-            .await?;
-
-        Ok(Self { client, keyspace })
+        Self::new0(options, None).await
     }
-
-    fn write_error(key: &str, error: OxiaError) -> MetadataError {
-        match error {
-            OxiaError::UnexpectedVersionId => MetadataError::Conflict(key.to_string()),
-            error => MetadataError::Oxia(error),
-        }
+    pub async fn with_meter(options: &OxiaOptions, meter: Meter) -> Result<Self> {
+        Self::new0(options, Some(meter)).await
     }
-
-    fn schema_path0(&self, database: &str) -> Result<String> {
-        self.keyspace
-            .collection(DATABASE_PATH, database, SCHEMA_PATH)
+    async fn new0(options: &OxiaOptions, meter: Option<Meter>) -> Result<Self> {
+        let identity = Uuid::new_v4().to_string();
+        let client = connect(options, &identity).await?;
+        Ok(Self {
+            engine: Engine::new(Arc::new(OxiaStorage { client, identity }), meter),
+        })
     }
+}
 
-    fn object_path0(&self, database: &str, schema: &str, path: &str) -> Result<String> {
-        self.keyspace
-            .collection(&self.schema_path0(database)?, schema, path)
+struct OxiaStorage {
+    // Immutable state
+    client: OxiaClient,
+    identity: String,
+}
+
+fn row0(record: GetResult) -> Row {
+    Row {
+        key: record.key,
+        value: record.value.unwrap_or_default().to_vec(),
+        version: record.version.version_id,
     }
+}
 
-    async fn get0<T>(
-        &self,
-        key: &str,
-        partition_key: Option<&str>,
-    ) -> Result<Option<MetadataRecord<T>>>
-    where
-        T: Message + Default,
-    {
-        let request = self.client.get(key);
-        let result = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key).await,
-            None => request.await,
-        };
-        match result {
-            Ok(record) => {
-                let value = T::decode(record.value.unwrap_or_default())?;
-                let version = MetadataVersion::new(record.version.version_id);
-                Ok(Some(MetadataRecord::new(value, version)))
-            }
-            Err(OxiaError::KeyNotFound) => Ok(None),
-            Err(error) => Err(error.into()),
-        }
+fn error0(error: OxiaError) -> MetadataError {
+    match error {
+        OxiaError::UnexpectedVersionId => MetadataError::Conflict("backend version".into()),
+        OxiaError::KeyNotFound => MetadataError::NotFound,
+        OxiaError::Closed => MetadataError::Closed,
+        error => MetadataError::Oxia(error),
     }
+}
 
-    async fn put0<T>(
-        &self,
-        key: &str,
-        value: &T,
-        condition: MetadataPutCondition,
-        partition_key: Option<&str>,
-    ) -> Result<MetadataVersion>
-    where
-        T: Message,
-    {
-        let request = self.client.put(key, value.encode_to_vec());
-        let request = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key),
-            None => request,
-        };
-        let result = match condition {
-            MetadataPutCondition::Unconditional => request.await,
-            MetadataPutCondition::NotExists => request.expected_record_not_exists().await,
-            MetadataPutCondition::Version(version) => {
-                request.expected_version_id(version.value()).await
-            }
-        }
-        .map_err(|error| Self::write_error(key, error))?;
-
-        Ok(MetadataVersion::new(result.version.version_id))
+async fn connect(options: &OxiaOptions, identity: &str) -> Result<OxiaClient> {
+    if options.namespace().is_empty() || options.service_address().is_empty() {
+        return Err(MetadataError::InvalidRecord(
+            "metadata endpoint and namespace are required",
+        ));
     }
-
-    async fn delete0(
-        &self,
-        key: &str,
-        expected_version: Option<MetadataVersion>,
-        partition_key: Option<&str>,
-    ) -> Result<()> {
-        let request = self.client.delete(key);
-        let request = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key),
-            None => request,
-        };
-        let result = match expected_version {
-            Some(version) => request.expected_version_id(version.value()).await,
-            None => request.await,
-        };
-        result.map_err(|error| Self::write_error(key, error))?;
-        Ok(())
-    }
-
-    async fn scan0<T>(
-        &self,
-        prefix: &str,
-        partition_key: Option<&str>,
-    ) -> Result<Vec<MetadataRecord<T>>>
-    where
-        T: Message + Default,
-    {
-        let (first, last) = self.keyspace.range(prefix)?;
-        let request = self.client.range_scan(first, last);
-        let records = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key).await?,
-            None => request.await?,
-        };
-        records
-            .into_iter()
-            .map(|record| {
-                let value = T::decode(record.value.unwrap_or_default())?;
-                let version = MetadataVersion::new(record.version.version_id);
-                Ok(MetadataRecord::new(value, version))
-            })
-            .collect()
-    }
-
-    async fn scan_direct0<T>(
-        &self,
-        prefix: &str,
-        partition_key: Option<&str>,
-    ) -> Result<Vec<MetadataRecord<T>>>
-    where
-        T: Message + Default,
-    {
-        let (first, last) = self.keyspace.range(prefix)?;
-        let request = self.client.range_scan(first, last);
-        let records = match partition_key {
-            Some(partition_key) => request.partition_key(partition_key).await?,
-            None => request.await?,
-        };
-        records
-            .into_iter()
-            .filter(|record| {
-                record
-                    .key
-                    .strip_prefix(prefix)
-                    .is_some_and(|name| !name.contains('/'))
-            })
-            .map(|record| {
-                let value = T::decode(record.value.unwrap_or_default())?;
-                let version = MetadataVersion::new(record.version.version_id);
-                Ok(MetadataRecord::new(value, version))
-            })
-            .collect()
-    }
+    Ok(OxiaClient::builder()
+        .identity(identity)
+        .service_address(options.service_address())
+        .namespace(options.namespace())
+        .request_timeout(options.request_timeout())
+        .session_timeout(options.session_timeout())
+        .session_keep_alive(options.session_timeout() / 10)
+        .build()
+        .await?)
 }
 
 #[async_trait]
-impl Metadata for OxiaMetadata {
-    async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<User>>> {
-        let key = self.keyspace.object(USER_PATH, name)?;
-        self.get0(&key, Some(USER_PARTITION_KEY)).await
+impl Storage for OxiaStorage {
+    fn backend(&self) -> &'static str {
+        "oxia"
     }
-
-    async fn put_user(
+    async fn get(&self, key: &str) -> Result<Option<Row>> {
+        match self.client.get(key).partition_key(PARTITION).await {
+            Ok(record) => Ok(Some(row0(record))),
+            Err(OxiaError::KeyNotFound) => Ok(None),
+            Err(error) => Err(error0(error)),
+        }
+    }
+    async fn scan(&self, first: &str, last: &str) -> Result<Vec<Row>> {
+        Ok(self
+            .client
+            .range_scan(first, last)
+            .partition_key(PARTITION)
+            .await?
+            .into_iter()
+            .map(row0)
+            .collect())
+    }
+    async fn put(
         &self,
-        user: User,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        validate_user(&user)?;
-        let key = self.keyspace.object(USER_PATH, &user.name)?;
-        self.put0(&key, &user, condition, Some(USER_PARTITION_KEY))
+        key: &str,
+        value: Vec<u8>,
+        condition: Condition,
+        index: Option<(&str, &str)>,
+    ) -> Result<Row> {
+        let request = self.client.put(key, value.clone()).partition_key(PARTITION);
+        let request = match condition {
+            Condition::Missing => request.expected_record_not_exists(),
+            Condition::Version(version) => request.expected_version_id(version),
+        };
+        let request = match index {
+            Some((index, name)) => request.secondary_index(index, name),
+            None => request,
+        };
+        let result = request.await.map_err(error0)?;
+        Ok(Row {
+            key: result.key,
+            value,
+            version: result.version.version_id,
+        })
+    }
+    async fn delete(&self, key: &str, version: i64) -> Result<()> {
+        self.client
+            .delete(key)
+            .partition_key(PARTITION)
+            .expected_version_id(version)
             .await
+            .map_err(error0)
     }
-
-    async fn delete_user(
-        &self,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let key = self.keyspace.object(USER_PATH, name)?;
-        self.delete0(&key, expected_version, Some(USER_PARTITION_KEY))
+    fn identity(&self) -> &str {
+        &self.identity
+    }
+    async fn subscribe(&self, key: &str) -> Result<Box<dyn PresenceEvents>> {
+        Ok(Box::new(Events {
+            stream: self.client.notifications().await?,
+            key: key.into(),
+        }))
+    }
+    async fn fetch_presence(&self, key: &str) -> Result<Option<Presence>> {
+        match self
+            .client
+            .get(key)
+            .partition_key("discovery/catalog")
             .await
+        {
+            Ok(row) => Ok(Some(presence(row))),
+            Err(OxiaError::KeyNotFound) => Ok(None),
+            Err(error) => Err(error0(error)),
+        }
     }
-
-    async fn list_users(&self) -> Result<Vec<MetadataRecord<User>>> {
-        self.scan_direct0(USER_PATH, Some(USER_PARTITION_KEY)).await
-    }
-
-    async fn rename_user(
-        &self,
-        name: &str,
-        user: User,
-        expected_version: MetadataVersion,
-    ) -> Result<MetadataVersion> {
-        validate_user(&user)?;
-        let old_key = self.keyspace.object(USER_PATH, name)?;
-        let new_key = self.keyspace.object(USER_PATH, &user.name)?;
-        let put = self.put0(
-            &new_key,
-            &user,
-            MetadataPutCondition::NotExists,
-            Some(USER_PARTITION_KEY),
-        );
-        let delete = self.delete0(&old_key, Some(expected_version), Some(USER_PARTITION_KEY));
-        let (version, ()) = tokio::try_join!(put, delete)?;
-        Ok(version)
-    }
-
-    async fn delete_users(&self, users: &[(String, MetadataVersion)]) -> Result<()> {
-        let records = users
-            .iter()
-            .map(|(name, version)| Ok((self.keyspace.object(USER_PATH, name)?, *version)))
-            .collect::<Result<Vec<_>>>()?;
-        try_join_all(
-            records
-                .iter()
-                .map(|(key, version)| self.delete0(key, Some(*version), Some(USER_PARTITION_KEY))),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn get_database(&self, name: &str) -> Result<Option<MetadataRecord<Database>>> {
-        let key = self.keyspace.object(DATABASE_PATH, name)?;
-        self.get0(&key, Some(name)).await
-    }
-
-    async fn put_database(
-        &self,
-        database: Database,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let key = self.keyspace.object(DATABASE_PATH, &database.name)?;
-        self.put0(&key, &database, condition, Some(&database.name))
+    async fn create_presence(&self, key: &str, value: Vec<u8>) -> Result<Presence> {
+        let result = self
+            .client
+            .put(key, value.clone())
+            .partition_key("discovery/catalog")
+            .expected_record_not_exists()
+            .ephemeral()
             .await
+            .map_err(error0)?;
+        Ok(Presence {
+            session: result.version.session_id,
+            owner: result.version.client_identity,
+            row: Row {
+                key: result.key,
+                value,
+                version: result.version.version_id,
+            },
+        })
     }
-
-    async fn delete_database(
-        &self,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let key = self.keyspace.object(DATABASE_PATH, name)?;
-        self.delete0(&key, expected_version, Some(name)).await
-    }
-
-    async fn list_databases(&self) -> Result<Vec<MetadataRecord<Database>>> {
-        self.scan_direct0(DATABASE_PATH, None).await
-    }
-
-    async fn get_schema(
-        &self,
-        database: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Schema>>> {
-        let key = self.keyspace.object(&self.schema_path0(database)?, name)?;
-        self.get0(&key, Some(database)).await
-    }
-
-    async fn put_schema(
-        &self,
-        database: &str,
-        schema: Schema,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let key = self
-            .keyspace
-            .object(&self.schema_path0(database)?, &schema.name)?;
-        self.put0(&key, &schema, condition, Some(database)).await
-    }
-
-    async fn delete_schema(
-        &self,
-        database: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let key = self.keyspace.object(&self.schema_path0(database)?, name)?;
-        self.delete0(&key, expected_version, Some(database)).await
-    }
-
-    async fn list_schemas(&self, database: &str) -> Result<Vec<MetadataRecord<Schema>>> {
-        self.scan_direct0(&self.schema_path0(database)?, Some(database))
+    async fn delete_presence(&self, key: &str, version: i64) -> Result<()> {
+        self.client
+            .delete(key)
+            .partition_key("discovery/catalog")
+            .expected_version_id(version)
             .await
+            .map_err(error0)
     }
-
-    async fn get_secret(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Secret>>> {
-        let path = self.object_path0(database, schema, SECRET_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.get0(&key, Some(database)).await
-    }
-
-    async fn put_secret(
-        &self,
-        database: &str,
-        schema: &str,
-        secret: Secret,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let path = self.object_path0(database, schema, SECRET_PATH)?;
-        let key = self.keyspace.object(&path, &secret.name)?;
-        self.put0(&key, &secret, condition, Some(database)).await
-    }
-
-    async fn delete_secret(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let path = self.object_path0(database, schema, SECRET_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version, Some(database)).await
-    }
-
-    async fn list_secrets(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Secret>>> {
-        let path = self.object_path0(database, schema, SECRET_PATH)?;
-        self.scan0(&path, Some(database)).await
-    }
-
-    async fn get_connection(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-    ) -> Result<Option<MetadataRecord<Connection>>> {
-        let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.get0(&key, Some(database)).await
-    }
-
-    async fn put_connection(
-        &self,
-        database: &str,
-        schema: &str,
-        connection: Connection,
-        condition: MetadataPutCondition,
-    ) -> Result<MetadataVersion> {
-        let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        let key = self.keyspace.object(&path, &connection.name)?;
-        self.put0(&key, &connection, condition, Some(database))
+    async fn list_presence(&self) -> Result<Vec<Presence>> {
+        // The only supported component kind is Catalog. Read the entire discovery
+        // range to reject unknown/malformed prefixes instead of returning partial data.
+        Ok(self
+            .client
+            .range_scan("/discovery/", "/discovery/~")
             .await
+            .map_err(error0)?
+            .into_iter()
+            .map(presence)
+            .collect())
     }
-
-    async fn delete_connection(
-        &self,
-        database: &str,
-        schema: &str,
-        name: &str,
-        expected_version: Option<MetadataVersion>,
-    ) -> Result<()> {
-        let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        let key = self.keyspace.object(&path, name)?;
-        self.delete0(&key, expected_version, Some(database)).await
-    }
-
-    async fn list_connections(
-        &self,
-        database: &str,
-        schema: &str,
-    ) -> Result<Vec<MetadataRecord<Connection>>> {
-        let path = self.object_path0(database, schema, CONNECTION_PATH)?;
-        self.scan0(&path, Some(database)).await
+    async fn close(&self) -> Result<()> {
+        self.client.close().await.map_err(error0)
     }
 }
+
+fn presence(record: GetResult) -> Presence {
+    Presence {
+        session: record.version.session_id,
+        owner: record.version.client_identity.clone(),
+        row: row0(record),
+    }
+}
+
+struct Events {
+    stream: Notifications,
+    key: String,
+}
+#[async_trait]
+impl PresenceEvents for Events {
+    async fn next(&mut self) -> bool {
+        while let Some(event) = self.stream.recv().await {
+            match &event {
+                Notification::KeyRangeDeleted {
+                    key,
+                    key_range_last,
+                } => {
+                    if key <= &self.key
+                        && key_range_last.as_ref().is_none_or(|last| &self.key < last)
+                    {
+                        return true;
+                    }
+                }
+                _ if event.key() == self.key => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+}
+
+metadata_impl!(OxiaMetadata);

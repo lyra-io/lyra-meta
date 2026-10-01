@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package io.lyra.meta.v1;
+
+// /catalog (partition: catalog). Absence is distinct from initialized=false.
+message Instance {
+  optional bool initialized = 1;
+}
+
+// /catalog/databases/<hex-encoded UTF-8 canonical name> (partition: catalog).
+message Database {
+  string name = 1;
+  uint32 owner_user_id = 2;
+  // Absent means true / -1, respectively. Zero is a valid connection limit.
+  optional bool allow_connections = 3;
+  optional sint32 connection_limit = 4;
+  DatabaseState state = 5;
+  uint32 id = 6;
+}
+
+enum DatabaseState {
+  READY = 0;
+  DROPPING = 1;
+  DROP_FAILED = 2;
+}
+
+// /catalog/users/<hex-encoded UTF-8 canonical name> (partition: catalog).
+message User {
+  string name = 1;
+  ScramSha256Verifier password_verifier = 2;
+  uint32 id = 3;
+}
+
+// /catalog/allocator/database or /catalog/allocator/user (partition: catalog).
+// Durable high-water mark, advanced with version CAS; never deleted or reset.
+message Allocator {
+  uint32 last_allocated = 1;
+}
+
+// Private authentication material. Never expose through SQL, logs, or metrics.
+message ScramSha256Verifier {
+  bytes salt = 1;
+  uint32 iterations = 2;
+  bytes stored_key = 3;
+  bytes server_key = 4;
+}
+
+// /discovery/<component-type>/instances/<registration-uuid>
+// (partition: discovery/<component-type>). The UUID is only in the key.
+message Component {
+  oneof kind {
+    CatalogComponent catalog = 2;
+  }
+}
+
+message CatalogComponent {}
