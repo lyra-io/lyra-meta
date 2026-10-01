@@ -23,6 +23,8 @@ struct FaultStorage {
     allocations: AtomicUsize,
     fail_at: AtomicUsize,
     writes: AtomicUsize,
+    presence_fault: AtomicU8,
+    presence_writes: AtomicUsize,
 }
 
 impl FaultStorage {
@@ -83,9 +85,23 @@ impl Storage for FaultStorage {
         self.base.subscribe(key).await
     }
     async fn fetch_presence(&self, key: &str) -> Result<Option<Presence>> {
+        match self.presence_fault.load(Ordering::Acquire) {
+            1 => return Err(MetadataError::Timeout),
+            2 => return pending().await,
+            _ => {}
+        }
         self.base.fetch_presence(key).await
     }
     async fn create_presence(&self, key: &str, value: Vec<u8>) -> Result<Presence> {
+        self.presence_writes.fetch_add(1, Ordering::AcqRel);
+        match self.presence_fault.swap(0, Ordering::AcqRel) {
+            4 => {
+                self.base.create_presence(key, value).await?;
+                return Err(MetadataError::Timeout);
+            }
+            5 => return Err(MetadataError::Timeout),
+            _ => {}
+        }
         self.base.create_presence(key, value).await
     }
     async fn delete_presence(&self, key: &str, version: i64) -> Result<()> {
@@ -97,6 +113,41 @@ impl Storage for FaultStorage {
     async fn close(&self) -> Result<()> {
         self.base.close().await
     }
+}
+
+#[tokio::test]
+async fn startup_registration_failure_is_never_retried_or_claimed_clean_without_evidence() {
+    for mode in [4, 5] {
+        let store = Arc::new(FaultStorage::default());
+        let engine = Engine::new(store.clone(), None);
+        store.presence_fault.store(mode, Ordering::Release);
+        assert!(engine.monitor.register().await.is_err());
+        assert!(matches!(
+            engine.monitor.register().await,
+            Err(MetadataError::RegistrationAttempted)
+        ));
+        let close = engine.monitor.close().await;
+        assert_eq!(
+            close.is_ok(),
+            mode == 4,
+            "only the observed committed record can be reconciled"
+        );
+        assert_eq!(store.presence_writes.load(Ordering::Acquire), 1);
+    }
+}
+
+#[tokio::test]
+async fn fresh_registration_reads_bound_backend_and_queue_waits() {
+    let store = Arc::new(FaultStorage::default());
+    let engine = Engine::new(store.clone(), None);
+    engine.monitor.register().await.unwrap();
+    for mode in [1, 2] {
+        store.presence_fault.store(mode, Ordering::Release);
+        let read = timeout(Duration::from_millis(1200), engine.monitor.is_registered()).await;
+        assert!(matches!(read.unwrap(), Err(MetadataError::Timeout)));
+    }
+    store.presence_fault.store(0, Ordering::Release);
+    engine.monitor.close().await.unwrap();
 }
 
 async fn initialized() -> (Arc<FaultStorage>, Engine, u32) {

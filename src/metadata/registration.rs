@@ -43,6 +43,7 @@ struct State {
     closing: AtomicBool,
     worker_alive: AtomicBool,
     cleanup_unconfirmed: AtomicBool,
+    write_uncertain: AtomicBool,
     status: AtomicU8,
     gate: Mutex<()>,
     last_warning: StdMutex<Option<Instant>>,
@@ -104,6 +105,7 @@ impl Monitor {
                 closing: AtomicBool::new(false),
                 worker_alive: AtomicBool::new(false),
                 cleanup_unconfirmed: AtomicBool::new(false),
+                write_uncertain: AtomicBool::new(false),
                 status: AtomicU8::new(IDLE),
                 gate: Mutex::new(()),
                 last_warning: StdMutex::new(None),
@@ -296,10 +298,7 @@ async fn run(state: Arc<State>, initial: oneshot::Sender<Result<()>>) {
     let setup = async {
         // Subscription establishment must be confirmed before the initial put.
         let events = state.store.subscribe(key).await?;
-        let row = state
-            .store
-            .create_presence(key, catalog().encode_to_vec())
-            .await?;
+        let row = create0(&state, key).await?;
         owned(&state, &row)?;
         let row = state
             .store
@@ -361,10 +360,7 @@ async fn run(state: Arc<State>, initial: oneshot::Sender<Result<()>>) {
                     if state.context.is_cancelled() {
                         return Err(MetadataError::Closed);
                     }
-                    let result = state
-                        .store
-                        .create_presence(key, catalog().encode_to_vec())
-                        .await;
+                    let result = create0(&state, key).await;
                     state
                         .metrics
                         .registration("catalog", "register", result.is_ok());
@@ -383,6 +379,7 @@ async fn run(state: Arc<State>, initial: oneshot::Sender<Result<()>>) {
         .unwrap_or(Err(MetadataError::Timeout));
         match result {
             Ok(()) => {
+                state.write_uncertain.store(false, Ordering::Release);
                 if state.status.swap(READY, Ordering::AcqRel) == RECOVERING {
                     tracing::info!(
                         event = "registration_recovered",
@@ -410,6 +407,20 @@ async fn run(state: Arc<State>, initial: oneshot::Sender<Result<()>>) {
     cleanup(&state).await;
 }
 
+async fn create0(state: &State, key: &str) -> Result<Presence> {
+    // A cancelled RPC may still be queued in the SDK. Until its outcome is
+    // confirmed, an absent-key cleanup read is not proof of remote cleanup.
+    state.write_uncertain.store(true, Ordering::Release);
+    let result = state
+        .store
+        .create_presence(key, catalog().encode_to_vec())
+        .await;
+    if result.is_ok() || matches!(&result, Err(MetadataError::Conflict(_))) {
+        state.write_uncertain.store(false, Ordering::Release);
+    }
+    result
+}
+
 async fn cleanup(state: &State) {
     // Serializes cleanup with all recovery puts. Conditional delete cannot erase
     // a replaced record. A cancelled/uncertain put still belongs to our session.
@@ -419,6 +430,9 @@ async fn cleanup(state: &State) {
         if let Some(row) = state.store.fetch_presence(key).await? {
             owned(state, &row)?;
             state.store.delete_presence(key, row.row.version).await?;
+            state.write_uncertain.store(false, Ordering::Release);
+        } else if state.write_uncertain.load(Ordering::Acquire) {
+            return Err(MetadataError::UncertainWrite);
         }
         Ok::<_, MetadataError>(())
     })
