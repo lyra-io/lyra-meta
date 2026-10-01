@@ -173,14 +173,17 @@ impl Storage for OxiaStorage {
             .map_err(error0)
     }
     async fn list_presence(&self) -> Result<Vec<Presence>> {
-        // The only supported component kind is Catalog. Read the entire discovery
-        // range to reject unknown/malformed prefixes instead of returning partial data.
+        // Oxia compares path segments, not plain bytes: /discovery/~ sorts
+        // BEFORE nested registration paths. Bound by a later sibling segment,
+        // then exclude adjacent namespaces from that slightly broader range.
+        // Keep all actual discovery children so malformed kinds fail closed.
         Ok(self
             .client
-            .range_scan("/discovery/", "/discovery/~")
+            .range_scan("/discovery/", "/discovery0/")
             .await
             .map_err(error0)?
             .into_iter()
+            .filter(|record| record.key.starts_with("/discovery/"))
             .map(presence)
             .collect())
     }
@@ -206,16 +209,9 @@ impl PresenceEvents for Events {
     async fn next(&mut self) -> bool {
         while let Some(event) = self.stream.recv().await {
             match &event {
-                Notification::KeyRangeDeleted {
-                    key,
-                    key_range_last,
-                } => {
-                    if key <= &self.key
-                        && key_range_last.as_ref().is_none_or(|last| &self.key < last)
-                    {
-                        return true;
-                    }
-                }
+                // A range deletion is only a hint. Re-read the exact owned key
+                // rather than duplicating Oxia's slash-aware range comparator.
+                Notification::KeyRangeDeleted { .. } => return true,
                 _ if event.key() == self.key => return true,
                 _ => {}
             }

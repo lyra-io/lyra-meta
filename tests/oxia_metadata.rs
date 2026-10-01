@@ -55,7 +55,11 @@ async fn foundation_contract_on_real_oxia() {
         .build()
         .await
         .unwrap();
-    let records = raw.range_scan("/discovery/", "/discovery/~").await.unwrap();
+    // The broad slash-aware scan must not treat adjacent namespaces as discovery.
+    raw.put("/discovery-other/item", vec![1]).await.unwrap();
+    assert_eq!(a.list_components().await.unwrap().len(), 2);
+    raw.delete("/discovery-other/item").await.unwrap();
+    let records = raw.range_scan("/discovery/", "/discovery0/").await.unwrap();
     assert_eq!(records.len(), 2);
     let removed = &records[0];
     raw.delete(&removed.key)
@@ -90,7 +94,7 @@ async fn foundation_contract_on_real_oxia() {
     assert_eq!(b.list_components().await.unwrap().len(), 1);
     b.close().await.unwrap();
     assert!(
-        raw.range_scan("/discovery/", "/discovery/~")
+        raw.range_scan("/discovery/", "/discovery0/")
             .await
             .unwrap()
             .is_empty()
@@ -101,7 +105,7 @@ async fn foundation_contract_on_real_oxia() {
     let c = OxiaMetadata::new(&options).await.unwrap();
     c.register_catalog_component().await.unwrap();
     let row = raw
-        .range_scan("/discovery/", "/discovery/~")
+        .range_scan("/discovery/", "/discovery0/")
         .await
         .unwrap()
         .remove(0);
