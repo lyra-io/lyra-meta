@@ -55,11 +55,24 @@ async fn foundation_contract_on_real_oxia() {
         .build()
         .await
         .unwrap();
-    // The broad slash-aware scan must not treat adjacent namespaces as discovery.
+    // Discovery enumeration must not treat adjacent namespaces as components.
     raw.put("/discovery-other/item", vec![1]).await.unwrap();
     assert_eq!(a.list_components().await.unwrap().len(), 2);
     raw.delete("/discovery-other/item").await.unwrap();
-    let records = raw.range_scan("/discovery/", "/discovery0/").await.unwrap();
+    let first = "/discovery/catalog/instances/";
+    let last = "/discovery/catalog/instances/~";
+    let invalid = "/discovery/catalog/instances/not-a-uuid";
+    raw.put(invalid, vec![0x12, 0x00])
+        .partition_key("discovery/catalog")
+        .ephemeral()
+        .await
+        .unwrap();
+    assert!(a.list_components().await.is_err());
+    raw.delete(invalid)
+        .partition_key("discovery/catalog")
+        .await
+        .unwrap();
+    let records = raw.range_scan(first, last).await.unwrap();
     assert_eq!(records.len(), 2);
     let removed = &records[0];
     raw.delete(&removed.key)
@@ -93,22 +106,13 @@ async fn foundation_contract_on_real_oxia() {
     assert!(b.is_registered().await.unwrap());
     assert_eq!(b.list_components().await.unwrap().len(), 1);
     b.close().await.unwrap();
-    assert!(
-        raw.range_scan("/discovery/", "/discovery0/")
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(raw.range_scan(first, last).await.unwrap().is_empty());
     assert!(raw.get("/catalog").partition_key("catalog").await.is_ok());
     // Same UUID/payload is not ownership. A different SDK session taking the
     // key is terminal, and conditional cleanup must leave that record alone.
     let c = OxiaMetadata::new(&options).await.unwrap();
     c.register_catalog_component().await.unwrap();
-    let row = raw
-        .range_scan("/discovery/", "/discovery0/")
-        .await
-        .unwrap()
-        .remove(0);
+    let row = raw.range_scan(first, last).await.unwrap().remove(0);
     raw.delete(&row.key)
         .partition_key("discovery/catalog")
         .expected_version_id(row.version.version_id)

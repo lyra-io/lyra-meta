@@ -1,6 +1,7 @@
 use super::OxiaOptions;
 use crate::metadata::engine::{Engine, metadata_impl};
 use crate::metadata::keys::PARTITION;
+use crate::metadata::registration::PREFIX;
 use crate::metadata::storage::{Condition, Presence, PresenceEvents, Row, Storage};
 use crate::metadata::{Metadata, MetadataError, MetadataRecord, MetadataVersion, Result, UserInfo};
 use crate::proto::pb_meta::{Component, Database, Instance, ScramSha256Verifier};
@@ -173,17 +174,16 @@ impl Storage for OxiaStorage {
             .map_err(error0)
     }
     async fn list_presence(&self) -> Result<Vec<Presence>> {
-        // Oxia compares path segments, not plain bytes: /discovery/~ sorts
-        // BEFORE nested registration paths. Bound by a later sibling segment,
-        // then exclude adjacent namespaces from that slightly broader range.
-        // Keep all actual discovery children so malformed kinds fail closed.
+        // The default Oxia encoder groups keys by slash count. Scan the
+        // supported kind's leaf collection at its actual depth, not a recursive
+        // /discovery/ range. Add one leaf scan per kind as new kinds are defined.
         Ok(self
             .client
-            .range_scan("/discovery/", "/discovery0/")
+            .range_scan(PREFIX, format!("{PREFIX}~"))
+            .partition_key("discovery/catalog")
             .await
             .map_err(error0)?
             .into_iter()
-            .filter(|record| record.key.starts_with("/discovery/"))
             .map(presence)
             .collect())
     }
