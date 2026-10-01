@@ -4,13 +4,18 @@ use axum::{
     http::{Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder as HttpBuilder,
+    service::TowerToHyperService,
+};
 use prometheus::{Encoder, Registry, TextEncoder};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
-use tokio::task::JoinHandle;
-use tokio::time::timeout;
+use tokio::task::{JoinHandle, JoinSet};
+use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
@@ -39,13 +44,34 @@ impl MetricsServer {
         });
         let cancel = context.clone();
         let task = tokio::spawn(async move {
-            if axum::serve(listener, router)
-                .with_graceful_shutdown(cancel.cancelled_owned())
-                .await
-                .is_err()
-            {
-                tracing::warn!(event = "metrics_server_failed", "Prometheus server stopped");
+            // Own connection tasks: cancelling only axum::serve's accept loop
+            // leaves partial-header/slow-reader connections alive after close.
+            let mut connections = JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    Some(_) = connections.join_next(), if !connections.is_empty() => {}
+                    accepted = listener.accept() => {
+                        let (stream, _) = match accepted {
+                            Ok(accepted) => accepted,
+                            Err(_) => {
+                                tracing::warn!(event = "metrics_accept_failed", "Prometheus accept failed");
+                                sleep(Duration::from_secs(1)).await;
+                                continue;
+                            }
+                        };
+                        if connections.len() >= 128 { drop(stream); continue; }
+                        let service = TowerToHyperService::new(router.clone());
+                        connections.spawn(async move {
+                            let _ = HttpBuilder::new(TokioExecutor::new())
+                                .serve_connection(TokioIo::new(stream), service).await;
+                        });
+                    }
+                }
             }
+            connections.abort_all();
+            while connections.join_next().await.is_some() {}
         });
         Self {
             context,

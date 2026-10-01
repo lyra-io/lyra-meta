@@ -8,7 +8,7 @@ description = "Shared Lyra contracts: catalog types, authentication, metadata an
 
 [features]
 default = []
-observability = ["dep:opentelemetry_sdk", "dep:opentelemetry-prometheus", "dep:prometheus", "dep:tracing-subscriber", "dep:tracing-appender", "dep:axum", "dep:serde_json"]
+observability = ["dep:opentelemetry_sdk", "dep:opentelemetry-prometheus", "dep:prometheus", "dep:tracing-subscriber", "dep:axum", "dep:hyper-util", "dep:serde_json"]
 pprof = ["observability", "dep:pprof-rs", "dep:flate2"]
 tokio-console = ["observability", "dep:console-subscriber", "dep:tonic-console", "dep:tokio-stream", "tokio/tracing"]
 
@@ -34,8 +34,8 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = ["m
 opentelemetry-prometheus = { version = "0.32", optional = true }
 prometheus = { version = "0.14", optional = true }
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"], optional = true }
-tracing-appender = { version = "0.2", optional = true }
 axum = { version = "0.8", optional = true }
+hyper-util = { version = "0.1", features = ["server-auto", "service", "tokio"], optional = true }
 pprof-rs = { package = "pprof", version = "0.15", path = "vendor/pprof", features = ["prost-codec"], optional = true }
 flate2 = { version = "1", optional = true }
 console-subscriber = { version = "0.5", optional = true }

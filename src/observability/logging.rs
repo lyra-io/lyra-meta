@@ -1,13 +1,12 @@
+use super::stdout::{BoundedWriter, StdoutGuard};
 use crate::config::LogLevel;
 use crate::toolkit::ReloadError;
 use opentelemetry::metrics::{Meter, ObservableCounter};
 use serde_json::Value;
 use std::fmt;
-use std::io;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use tracing::{Event, Subscriber};
-use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{
     EnvFilter, Layer, Registry,
     filter::filter_fn,
@@ -59,7 +58,7 @@ pub(super) type ConsoleReload = reload::Handle<Option<DynamicLayer>, Registry>;
 pub(super) struct Logging {
     // Control state
     monitor: JoinHandle<()>,
-    _stdout: WorkerGuard,
+    _stdout: StdoutGuard,
     // Immutable state
     update: Box<dyn Fn(LogLevel) + Send + Sync>,
     pub(super) console: ConsoleReload,
@@ -81,15 +80,12 @@ fn filter(level: LogLevel) -> EnvFilter {
 }
 impl Logging {
     pub(super) fn new(meter: &Meter, level: LogLevel) -> Result<Self, ReloadError> {
-        let (writer, guard) = NonBlockingBuilder::default()
-            .buffered_lines_limit(1024)
-            .lossy(true)
-            .finish(io::stdout());
-        let drops = writer.error_counter();
+        let (writer, guard) = BoundedWriter::new().map_err(|_| ReloadError("stdout_setup"))?;
+        let drops = writer.clone();
         let counter = drops.clone();
         let dropped = meter
             .u64_observable_counter("lyra_catalog_log_dropped_total")
-            .with_callback(move |o| o.observe(counter.dropped_lines() as u64, &[]))
+            .with_callback(move |o| o.observe(counter.dropped(), &[]))
             .build();
         let (log_filter, update) = reload::Layer::new(filter(level));
         let log: DynamicLayer = tracing_subscriber::fmt::layer()
@@ -121,7 +117,7 @@ impl Logging {
             let mut ticks = tokio::time::interval(Duration::from_secs(5));
             loop {
                 ticks.tick().await;
-                let current = drops.dropped_lines();
+                let current = drops.dropped();
                 if current > previous {
                     tracing::warn!(
                         event = "log_records_dropped",

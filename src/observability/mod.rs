@@ -5,6 +5,7 @@ mod metrics;
 mod profile;
 mod runtime;
 mod service;
+mod stdout;
 
 pub use opentelemetry::{
     global::meter,
