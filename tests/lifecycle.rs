@@ -1,6 +1,8 @@
 use lyra_meta::metadata::{MemoryMetadata, Metadata, MetadataError};
 use lyra_meta::proto::pb_meta::component::Kind;
 use lyra_meta::utils::verifier::make_verifier;
+use std::future::{Future, poll_fn};
+use std::task::Poll;
 
 #[tokio::test]
 async fn bootstrap_is_idempotent_preserves_credentials_and_ids() {
@@ -53,7 +55,18 @@ async fn concurrent_bootstrap_and_independent_registration() {
     assert!(a.is_registered().await.unwrap());
     assert!(b.is_registered().await.unwrap());
     assert_eq!(a.list_components().await.unwrap().len(), 2);
-    a.close().await.unwrap();
+    // Cancel a caller after it starts shutdown, then resume concurrently. The
+    // private worker must still finish SDK cleanup before either call succeeds.
+    let mut cancelled = Box::pin(a.close());
+    poll_fn(|cx| {
+        let _ = cancelled.as_mut().poll(cx);
+        Poll::Ready(())
+    })
+    .await;
+    drop(cancelled);
+    let (one, two) = tokio::join!(a.close(), a.close());
+    one.unwrap();
+    two.unwrap();
     assert!(b.is_registered().await.unwrap());
     assert_eq!(b.list_components().await.unwrap().len(), 1);
     assert!(b.is_initialized().await.unwrap());

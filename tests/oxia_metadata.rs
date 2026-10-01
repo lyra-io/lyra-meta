@@ -102,7 +102,9 @@ async fn foundation_contract_on_real_oxia() {
     .unwrap();
     assert!(a.is_registered().await.unwrap());
     assert!(b.is_registered().await.unwrap());
-    a.close().await.unwrap();
+    let (one, two) = tokio::join!(a.close(), a.close());
+    one.unwrap();
+    two.unwrap();
     assert!(b.is_registered().await.unwrap());
     assert_eq!(b.list_components().await.unwrap().len(), 1);
     b.close().await.unwrap();

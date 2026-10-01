@@ -33,6 +33,7 @@ pub(crate) struct Monitor {
 struct State {
     // Control state
     context: CancellationToken,
+    worker_done: CancellationToken,
     // Immutable state
     store: Arc<dyn Storage>,
     metrics: Metrics,
@@ -100,6 +101,7 @@ impl Monitor {
         Self {
             state: Arc::new(State {
                 context: CancellationToken::new(),
+                worker_done: CancellationToken::new(),
                 store,
                 metrics,
                 key: OnceLock::new(),
@@ -161,7 +163,10 @@ impl Monitor {
                 });
                 drop(guard);
             })
-            .map_err(|_| MetadataError::RegistrationMonitorFailed)?;
+            .map_err(|_| {
+                self.state.worker_done.cancel();
+                MetadataError::RegistrationMonitorFailed
+            })?;
         *self.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread);
         // Cancellation of the caller must not leave a successful hidden registration.
         struct CancelOnDrop<'a>(&'a State, bool);
@@ -243,6 +248,13 @@ impl Monitor {
         self.state.closing.store(true, Ordering::Release);
         self.state.context.cancel();
         let _close = self.state.close_gate.lock().await;
+        if self.state.attempted.load(Ordering::Acquire) {
+            // A cancelled close must not take the join handle and then let a
+            // subsequent close drain the SDK while the worker still uses it.
+            timeout(Duration::from_secs(7), self.state.worker_done.cancelled())
+                .await
+                .map_err(|_| MetadataError::Timeout)?;
+        }
         let thread = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(thread) = thread {
             timeout(
@@ -295,6 +307,7 @@ impl Drop for WorkerGuard {
         if !self.0.closing.load(Ordering::Acquire) {
             self.0.status.store(FAILED, Ordering::Release);
         }
+        self.0.worker_done.cancel();
     }
 }
 
