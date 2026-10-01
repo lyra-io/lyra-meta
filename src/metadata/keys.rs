@@ -1,4 +1,5 @@
-use super::{MetadataError, Result};
+use super::{MetadataError, Result, validate_name};
+use std::fmt::Write;
 use uuid::Uuid;
 
 pub(crate) const CATALOG: &str = "/catalog";
@@ -13,43 +14,31 @@ pub(crate) enum Collection {
 impl Collection {
     pub(crate) fn prefix(self) -> &'static str {
         match self {
-            Self::Users => "/catalog/users/x",
-            Self::Databases => "/catalog/databases/x",
+            Self::Users => "/catalog/users/",
+            Self::Databases => "/catalog/databases/",
         }
     }
 
-    pub(crate) fn index(self) -> &'static str {
+    pub(crate) fn allocator(self) -> &'static str {
         match self {
-            Self::Users => "lyra.user.name",
-            Self::Databases => "lyra.database.name",
+            Self::Users => "/catalog/allocator/user",
+            Self::Databases => "/catalog/allocator/database",
         }
     }
 
     pub(crate) fn range(self) -> (String, String) {
-        let collection = self.prefix().strip_suffix('x').unwrap();
-        (collection.to_string(), format!("{collection}/"))
+        (self.prefix().into(), format!("{}~", self.prefix()))
     }
 
-    pub(crate) fn key(self, id: u32) -> Result<String> {
-        if id == 0 {
-            return Err(MetadataError::InvalidRecord("zero object ID"));
+    pub(crate) fn key(self, name: &str) -> Result<String> {
+        validate_name(name)?;
+        // Bijection over canonical UTF-8 bytes, without path/escaping aliases.
+        let mut key = String::with_capacity(self.prefix().len() + name.len() * 2);
+        key.push_str(self.prefix());
+        for byte in name.bytes() {
+            write!(&mut key, "{byte:02x}").unwrap();
         }
-        Ok(format!("{}-{id:020}", self.prefix()))
-    }
-
-    pub(crate) fn id(self, key: &str) -> Result<u32> {
-        let suffix = key
-            .strip_prefix(self.prefix())
-            .and_then(|s| s.strip_prefix('-'))
-            .filter(|s| s.len() == 20 && s.bytes().all(|b| b.is_ascii_digit()))
-            .ok_or(MetadataError::InvalidRecord("invalid object key"))?;
-        suffix
-            .parse::<u32>()
-            .ok()
-            .filter(|id| *id > 0)
-            .ok_or(MetadataError::InvalidRecord(
-                "object ID outside uint32 range",
-            ))
+        Ok(key)
     }
 }
 
@@ -76,22 +65,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn enforces_canonical_ids() {
+    fn canonical_names_have_distinct_safe_keys() {
         for kind in [Collection::Users, Collection::Databases] {
-            for id in [1, u32::MAX] {
-                assert_eq!(kind.id(&kind.key(id).unwrap()).unwrap(), id);
+            let names = [
+                "public",
+                "Public",
+                "a/b",
+                "a%2fb",
+                "a.b",
+                "数据库",
+                "é",
+                "e\u{301}",
+            ];
+            let keys: std::collections::HashSet<_> =
+                names.iter().map(|name| kind.key(name).unwrap()).collect();
+            assert_eq!(keys.len(), names.len());
+            let (first, last) = kind.range();
+            for key in keys {
+                assert!(key > first && key < last);
+                assert!(
+                    key.strip_prefix(kind.prefix())
+                        .unwrap()
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit())
+                );
             }
-            assert!(kind.key(0).is_err());
-            assert!(kind.id(&format!("{}-1", kind.prefix())).is_err());
-            assert!(
-                kind.id(&format!("{}-00000000004294967296", kind.prefix()))
-                    .is_err()
-            );
+            assert!(kind.key("").is_err());
+            assert!(kind.key("bad\0name").is_err());
         }
-        assert!(
-            Collection::Users
-                .id(&Collection::Databases.key(1).unwrap())
-                .is_err()
+        assert_eq!(
+            Collection::Databases.key("public").unwrap(),
+            "/catalog/databases/7075626c6963"
         );
     }
 }

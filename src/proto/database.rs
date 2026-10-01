@@ -3,6 +3,7 @@ use super::pb_meta::{Database, DatabaseState};
 impl Database {
     pub fn new(name: impl Into<String>, owner_user_id: u32) -> Self {
         Self {
+            id: 0, // assigned by Metadata, never selected by a caller
             name: name.into(),
             owner_user_id,
             allow_connections: Some(true),

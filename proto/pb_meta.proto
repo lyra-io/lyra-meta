@@ -7,8 +7,7 @@ message Instance {
   optional bool initialized = 1;
 }
 
-// /catalog/databases/x-<20-digit-sequence> (partition: catalog).
-// The nonzero uint32 ID comes from the key, not a duplicated value field.
+// /catalog/databases/<hex-encoded UTF-8 canonical name> (partition: catalog).
 message Database {
   string name = 1;
   uint32 owner_user_id = 2;
@@ -16,6 +15,7 @@ message Database {
   optional bool allow_connections = 3;
   optional sint32 connection_limit = 4;
   DatabaseState state = 5;
+  uint32 id = 6;
 }
 
 enum DatabaseState {
@@ -24,10 +24,17 @@ enum DatabaseState {
   DROP_FAILED = 2;
 }
 
-// /catalog/users/x-<20-digit-sequence> (partition: catalog).
+// /catalog/users/<hex-encoded UTF-8 canonical name> (partition: catalog).
 message User {
   string name = 1;
   ScramSha256Verifier password_verifier = 2;
+  uint32 id = 3;
+}
+
+// /catalog/allocator/database or /catalog/allocator/user (partition: catalog).
+// Durable high-water mark, advanced with version CAS; never deleted or reset.
+message Allocator {
+  uint32 last_allocated = 1;
 }
 
 // Private authentication material. Never expose through SQL, logs, or metrics.

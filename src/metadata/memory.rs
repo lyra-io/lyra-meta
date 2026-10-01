@@ -20,7 +20,6 @@ struct State {
     // Mutable state
     rows: BTreeMap<String, Row>,
     indexes: HashMap<String, (String, String)>,
-    sequences: HashMap<String, u64>,
     version: i64,
     closed: bool,
 }
@@ -90,33 +89,6 @@ impl Storage for MemoryStorage {
             .filter(|row| row.key.starts_with(first))
             .cloned()
             .collect())
-    }
-    async fn find(&self, index: &str, name: &str) -> Result<Vec<Row>> {
-        let state = self.state.lock().await;
-        check0(&state)?;
-        Ok(state
-            .indexes
-            .iter()
-            .filter(|(_, (i, n))| i == index && n == name)
-            .filter_map(|(key, _)| state.rows.get(key).cloned())
-            .collect())
-    }
-    async fn allocate(&self, prefix: &str, value: Vec<u8>, index: &str, name: &str) -> Result<Row> {
-        let mut state = self.state.lock().await;
-        check0(&state)?;
-        let next = state.sequences.entry(prefix.into()).or_default();
-        *next = next
-            .checked_add(1)
-            .ok_or_else(|| MetadataError::CounterExhausted("object sequence".into()))?;
-        let key = format!("{prefix}-{:020}", *next);
-        let row = Row {
-            key: key.clone(),
-            value,
-            version: version0(&mut state)?,
-        };
-        state.rows.insert(key.clone(), row.clone());
-        state.indexes.insert(key, (index.into(), name.into()));
-        Ok(row)
     }
     async fn put(
         &self,

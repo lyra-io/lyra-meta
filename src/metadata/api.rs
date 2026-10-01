@@ -42,8 +42,9 @@ pub struct UserInfo {
     pub name: String,
 }
 
-/// One lifecycle writer per namespace. Implementations serialize local mutations;
-/// this contract does not claim distributed writer fencing.
+/// Name creation and per-type ID allocation are atomic between clients.
+/// Database lifecycle/session coordination and user deletion still require one
+/// lifecycle writer per namespace; this is not distributed writer fencing.
 #[async_trait]
 pub trait Metadata: Send + Sync {
     async fn instance(&self) -> Result<Option<Instance>>;

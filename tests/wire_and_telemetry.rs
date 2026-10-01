@@ -1,6 +1,6 @@
 use lyra_meta::metadata::{MemoryMetadata, Metadata};
 use lyra_meta::proto::pb_meta::{
-    ComponentRegistration, Database, Instance, ScramSha256Verifier, User,
+    Allocator, ComponentRegistration, Database, Instance, ScramSha256Verifier, User,
 };
 use lyra_meta::utils::verifier::make_verifier;
 use opentelemetry::metrics::MeterProvider;
@@ -31,12 +31,14 @@ fn stable_wire_tags_and_redacted_credentials() {
         [8, 1]
     );
     assert!(ComponentRegistration {}.encode_to_vec().is_empty());
+    assert_eq!(Allocator { last_allocated: 7 }.encode_to_vec(), [8, 7]);
     let database = Database {
         name: "db".into(),
         owner_user_id: 7,
+        id: 9,
         ..Default::default()
     };
-    assert_eq!(database.encode_to_vec(), [10, 2, b'd', b'b', 16, 7]);
+    assert_eq!(database.encode_to_vec(), [10, 2, b'd', b'b', 16, 7, 48, 9]);
     assert!(database.accepts_connections());
     assert_eq!(database.effective_connection_limit(), -1);
     let database = Database {
@@ -47,7 +49,7 @@ fn stable_wire_tags_and_redacted_credentials() {
     };
     assert_eq!(
         database.encode_to_vec(),
-        [10, 2, b'd', b'b', 16, 7, 24, 0, 32, 0, 40, 2]
+        [10, 2, b'd', b'b', 16, 7, 24, 0, 32, 0, 40, 2, 48, 9]
     );
     let fixture = ScramSha256Verifier {
         salt: vec![1].into(),
@@ -60,6 +62,7 @@ fn stable_wire_tags_and_redacted_credentials() {
         [10, 1, 1, 16, 128, 32, 26, 1, 2, 34, 1, 3]
     );
     let user = User {
+        id: 1,
         name: "private-name".into(),
         password_verifier: Some(make_verifier("password-not-to-log").unwrap()),
     };

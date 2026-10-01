@@ -5,7 +5,9 @@ use super::{
     DEFAULT_DATABASE_NAME, MetadataError, MetadataRecord, MetadataVersion, Result,
     SYSTEM_DATABASE_NAME, SYSTEM_USER_NAME, UserInfo, validate_name,
 };
-use crate::proto::pb_meta::{Database, DatabaseState, Instance, ScramSha256Verifier, User};
+use crate::proto::pb_meta::{
+    Allocator, Database, DatabaseState, Instance, ScramSha256Verifier, User,
+};
 use crate::utils::verifier::validate_verifier;
 use opentelemetry::metrics::Meter;
 use prost::Message;
@@ -115,7 +117,20 @@ impl Engine {
             Err(_) => return Err(MetadataError::IncompleteInitialization),
         };
         *blocked = false;
+        for kind in [Collection::Users, Collection::Databases] {
+            *blocked = true;
+            self.store
+                .put(
+                    kind.allocator(),
+                    Allocator { last_allocated: 0 }.encode_to_vec(),
+                    Condition::Missing,
+                    None,
+                )
+                .await?;
+            *blocked = false;
+        }
         let user = User {
+            id: 0,
             name: SYSTEM_USER_NAME.into(),
             password_verifier: Some(verifier),
         };
@@ -127,7 +142,7 @@ impl Engine {
                 &mut blocked,
             )
             .await?;
-        let owner = Collection::Users.id(&user.key)?;
+        let owner = decode_user(&user)?.id();
         for name in [SYSTEM_DATABASE_NAME, DEFAULT_DATABASE_NAME] {
             let mut database = Database::new(name, owner);
             if name == SYSTEM_DATABASE_NAME {
@@ -173,6 +188,29 @@ impl Engine {
             .find(|u| u.value().name == SYSTEM_USER_NAME)
             .ok_or(MetadataError::Integrity("system user missing"))?;
         let databases = self.list_databases().await?;
+        for (kind, maximum) in [
+            (
+                Collection::Users,
+                users.iter().map(|user| user.id()).max().unwrap_or(0),
+            ),
+            (
+                Collection::Databases,
+                databases
+                    .iter()
+                    .map(|database| database.id())
+                    .max()
+                    .unwrap_or(0),
+            ),
+        ] {
+            let row = self
+                .store
+                .get(kind.allocator())
+                .await?
+                .ok_or(MetadataError::Integrity("allocator missing"))?;
+            if Allocator::decode(row.value.as_slice())?.last_allocated < maximum {
+                return Err(MetadataError::Integrity("allocator behind object IDs"));
+            }
+        }
         let system = databases
             .iter()
             .find(|db| db.value().name == SYSTEM_DATABASE_NAME)
@@ -185,20 +223,13 @@ impl Engine {
     }
 
     async fn unique0(&self, kind: Collection, name: &str) -> Result<Option<Row>> {
-        validate_name(name)?;
-        let mut rows = self.store.find(kind.index(), name).await?;
-        if rows.len() > 1 {
-            return Err(MetadataError::Integrity(
-                "duplicate secondary-index matches",
-            ));
-        }
-        if let Some(row) = rows.pop() {
+        if let Some(row) = self.store.get(&kind.key(name)?).await? {
             let actual = match kind {
                 Collection::Users => decode_user(&row)?.value().name.clone(),
                 Collection::Databases => decode_database(&row)?.value().name.clone(),
             };
             if actual != name {
-                return Err(MetadataError::Integrity("name index disagrees with record"));
+                return Err(MetadataError::Integrity("name key disagrees with record"));
             }
             Ok(Some(row))
         } else {
@@ -215,12 +246,15 @@ impl Engine {
     }
 
     async fn user_id0(&self, id: u32) -> Result<Option<MetadataRecord<User>>> {
-        self.store
-            .get(&Collection::Users.key(id)?)
-            .await?
-            .as_ref()
-            .map(decode_user)
-            .transpose()
+        let (first, last) = Collection::Users.range();
+        let mut found = None;
+        for row in self.store.scan(&first, &last).await? {
+            let user = decode_user(&row)?;
+            if user.id() == id && found.replace(user).is_some() {
+                return Err(MetadataError::Integrity("duplicate user ID"));
+            }
+        }
+        Ok(found)
     }
 
     pub(crate) async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<UserInfo>>> {
@@ -241,15 +275,8 @@ impl Engine {
         let mut users = Vec::new();
         for row in self.store.scan(&first, &last).await? {
             let user = decode_user(&row)?;
-            if !names.insert(user.value().name.clone()) {
-                return Err(MetadataError::Integrity("duplicate user names"));
-            }
-            if self
-                .unique0(Collection::Users, &user.value().name)
-                .await?
-                .is_none_or(|found| found.key != row.key)
-            {
-                return Err(MetadataError::Integrity("missing user name index"));
+            if !names.insert(user.id()) {
+                return Err(MetadataError::Integrity("duplicate user IDs"));
             }
             users.push(public_user(user));
         }
@@ -275,6 +302,7 @@ impl Engine {
             return Err(MetadataError::AlreadyExists);
         }
         let user = User {
+            id: 0,
             name: name.into(),
             password_verifier: Some(verifier),
         };
@@ -301,8 +329,12 @@ impl Engine {
         {
             return Err(MetadataError::OwnerInUse);
         }
-        self.delete0(&Collection::Users.key(id)?, version.value(), &mut blocked)
-            .await
+        self.delete0(
+            &Collection::Users.key(&user.value().name)?,
+            version.value(),
+            &mut blocked,
+        )
+        .await
     }
     async fn owner0(&self, database: &Database) -> Result<()> {
         if self.user_id0(database.owner_user_id).await?.is_none() {
@@ -329,13 +361,14 @@ impl Engine {
         &self,
         id: u32,
     ) -> Result<Option<MetadataRecord<Database>>> {
-        let record = self
-            .store
-            .get(&Collection::Databases.key(id)?)
-            .await?
-            .as_ref()
-            .map(decode_database)
-            .transpose()?;
+        let (first, last) = Collection::Databases.range();
+        let mut record = None;
+        for row in self.store.scan(&first, &last).await? {
+            let database = decode_database(&row)?;
+            if database.id() == id && record.replace(database).is_some() {
+                return Err(MetadataError::Integrity("duplicate database ID"));
+            }
+        }
         if let Some(record) = &record {
             self.owner0(record.value()).await?;
         }
@@ -348,15 +381,8 @@ impl Engine {
         for row in self.store.scan(&first, &last).await? {
             let database = decode_database(&row)?;
             self.owner0(database.value()).await?;
-            if !names.insert(database.value().name.clone()) {
-                return Err(MetadataError::Integrity("duplicate database names"));
-            }
-            if self
-                .unique0(Collection::Databases, &database.value().name)
-                .await?
-                .is_none_or(|found| found.key != row.key)
-            {
-                return Err(MetadataError::Integrity("missing database name index"));
+            if !names.insert(database.id()) {
+                return Err(MetadataError::Integrity("duplicate database IDs"));
             }
             databases.push(database);
         }
@@ -368,6 +394,11 @@ impl Engine {
         database: Database,
     ) -> Result<MetadataRecord<Database>> {
         validate_database(&database)?;
+        if database.id != 0 {
+            return Err(MetadataError::InvalidRecord(
+                "new database ID must be allocated by Meta",
+            ));
+        }
         if database.state != DatabaseState::Ready as i32 {
             return Err(MetadataError::InvalidRecord("new database must be READY"));
         }
@@ -419,6 +450,11 @@ impl Engine {
         if old.version() != version {
             return Err(MetadataError::Conflict("database version".into()));
         }
+        if database.id != id || database.name != old.value().name {
+            return Err(MetadataError::InvalidRecord(
+                "database ID and name are immutable",
+            ));
+        }
         let old_state = old.value().state;
         if old_state == DatabaseState::DropFailed as i32 {
             return Err(MetadataError::InvalidRecord(
@@ -450,19 +486,12 @@ impl Engine {
             ));
         }
         self.owner0(&database).await?;
-        if self
-            .unique0(Collection::Databases, &database.name)
-            .await?
-            .is_some_and(|row| row.key != Collection::Databases.key(id).unwrap())
-        {
-            return Err(MetadataError::AlreadyExists);
-        }
         let row = self
             .put0(
-                &Collection::Databases.key(id)?,
+                &Collection::Databases.key(&database.name)?,
                 database.encode_to_vec(),
                 version.value(),
-                Some((Collection::Databases.index(), &database.name)),
+                None,
                 &mut blocked,
             )
             .await?;
@@ -487,7 +516,7 @@ impl Engine {
             ));
         }
         self.delete0(
-            &Collection::Databases.key(id)?,
+            &Collection::Databases.key(&old.value().name)?,
             version.value(),
             &mut blocked,
         )
@@ -501,53 +530,83 @@ impl Engine {
         value: Vec<u8>,
         blocked: &mut bool,
     ) -> Result<Row> {
-        // No independent allocator/tracker. Check the current sequence tail before
-        // issuing the direct object Put, under the single-writer mutation gate.
-        let (first, last) = kind.range();
-        for row in self.store.scan(&first, &last).await? {
-            if kind.id(&row.key)? == u32::MAX {
-                return Err(MetadataError::CounterExhausted("object ID".into()));
+        let id = self.allocate_id0(kind, blocked).await?;
+        let value = match kind {
+            Collection::Users => {
+                let mut user = User::decode(value.as_slice())?;
+                user.id = id;
+                user.encode_to_vec()
             }
-        }
-        // Cancellation during an in-flight write also leaves the gate blocked.
-        // Only a confirmed result/reconciliation clears it.
+            Collection::Databases => {
+                let mut database = Database::decode(value.as_slice())?;
+                database.id = id;
+                database.encode_to_vec()
+            }
+        };
+        let key = kind.key(name)?;
         *blocked = true;
-        let row = match self
+        match self
             .store
-            .allocate(kind.prefix(), value.clone(), kind.index(), name)
+            .put(&key, value.clone(), Condition::Missing, None)
             .await
         {
-            Ok(row) => row,
-            Err(_) => match self.unique0(kind, name).await {
-                Ok(Some(row)) if row.value == value => {
-                    self.metrics.reconciled("create");
-                    row
-                }
-                _ => {
-                    *blocked = true;
-                    return Err(MetadataError::UncertainWrite);
-                }
-            },
-        };
-        if kind.id(&row.key).is_err() {
-            // Never expose a truncated ID or leave a confirmed out-of-domain row.
-            if self.store.delete(&row.key, row.version).await.is_err() {
-                *blocked = true;
-                return Err(MetadataError::UncertainWrite);
-            }
-            *blocked = false;
-            return Err(MetadataError::CounterExhausted("object ID".into()));
-        }
-        match self.unique0(kind, name).await {
-            Ok(Some(found)) if found.key == row.key && found.value == value => {
+            Ok(row) => {
                 *blocked = false;
                 Ok(row)
             }
-            _ => {
-                *blocked = true;
-                Err(MetadataError::Integrity(
-                    "allocation could not be reconciled uniquely",
-                ))
+            Err(MetadataError::Conflict(_)) => {
+                *blocked = false;
+                Err(MetadataError::AlreadyExists)
+            }
+            Err(_) => match self.store.get(&key).await {
+                Ok(Some(row)) if row.value == value => {
+                    self.metrics.reconciled("create");
+                    *blocked = false;
+                    Ok(row)
+                }
+                _ => Err(MetadataError::UncertainWrite),
+            },
+        }
+    }
+
+    async fn allocate_id0(&self, kind: Collection, blocked: &mut bool) -> Result<u32> {
+        loop {
+            // Missing counters after bootstrap are corruption, not permission
+            // to start again at zero. Deleting objects never deletes this row.
+            let row = self
+                .store
+                .get(kind.allocator())
+                .await?
+                .ok_or(MetadataError::Integrity("allocator missing"))?;
+            let previous = Allocator::decode(row.value.as_slice())?.last_allocated;
+            let next = previous
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::CounterExhausted("object ID".into()))?;
+            *blocked = true;
+            match self
+                .store
+                .put(
+                    kind.allocator(),
+                    Allocator {
+                        last_allocated: next,
+                    }
+                    .encode_to_vec(),
+                    Condition::Version(row.version),
+                    None,
+                )
+                .await
+            {
+                Ok(_) => {
+                    *blocked = false;
+                    return Ok(next);
+                }
+                Err(MetadataError::Conflict(_)) => {
+                    *blocked = false;
+                    tokio::task::yield_now().await;
+                }
+                // A read-back high-water mark cannot tell which concurrent
+                // caller committed it. Never return an unconfirmed ID.
+                Err(_) => return Err(MetadataError::UncertainWrite),
             }
         }
     }
@@ -629,9 +688,12 @@ fn validate_database(database: &Database) -> Result<()> {
 }
 
 fn decode_database(row: &Row) -> Result<MetadataRecord<Database>> {
-    let id = Collection::Databases.id(&row.key)?;
     let database = Database::decode(row.value.as_slice())?;
     validate_database(&database)?;
+    let id = database.id;
+    if id == 0 || row.key != Collection::Databases.key(&database.name)? {
+        return Err(MetadataError::Integrity("database key or ID mismatch"));
+    }
     Ok(MetadataRecord::new(
         id,
         database,
@@ -639,9 +701,12 @@ fn decode_database(row: &Row) -> Result<MetadataRecord<Database>> {
     ))
 }
 fn decode_user(row: &Row) -> Result<MetadataRecord<User>> {
-    let id = Collection::Users.id(&row.key)?;
     let user = User::decode(row.value.as_slice())?;
     validate_name(&user.name)?;
+    let id = user.id;
+    if id == 0 || row.key != Collection::Users.key(&user.name)? {
+        return Err(MetadataError::Integrity("user key or ID mismatch"));
+    }
     validate_verifier(
         user.password_verifier
             .as_ref()

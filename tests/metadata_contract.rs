@@ -116,13 +116,39 @@ async fn contract(metadata: Arc<dyn Metadata>) {
     }
     let mut value = created.value().clone();
     value.name = "quoted / 数据库".into();
-    let renamed = metadata
+    assert!(matches!(
+        metadata
+            .update_database(created.id(), value, created.version())
+            .await,
+        Err(MetadataError::InvalidRecord(_))
+    ));
+    assert_eq!(
+        metadata.get_database("owner").await.unwrap().unwrap(),
+        created
+    );
+    assert!(
+        metadata
+            .get_database("quoted / 数据库")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let special = metadata
+        .create_database(Database::new("quoted / 数据库", owner.id()))
+        .await
+        .unwrap();
+    metadata
+        .delete_database(special.id(), special.version())
+        .await
+        .unwrap();
+    let mut value = created.value().clone();
+    value.connection_limit = Some(7);
+    let updated = metadata
         .update_database(created.id(), value.clone(), created.version())
         .await
         .unwrap();
-    assert_eq!(renamed.id(), created.id());
-    assert_eq!(renamed.value().owner_user_id, owner.id());
-    assert!(metadata.get_database("owner").await.unwrap().is_none());
+    assert_eq!(updated.id(), created.id());
+    assert_eq!(updated.value().owner_user_id, owner.id());
     assert_eq!(
         metadata
             .get_database(&value.name)
@@ -145,7 +171,7 @@ async fn contract(metadata: Arc<dyn Metadata>) {
         Err(MetadataError::Conflict(_))
     ));
     metadata
-        .delete_database(renamed.id(), renamed.version())
+        .delete_database(updated.id(), updated.version())
         .await
         .unwrap();
     assert!(metadata.get_database(&value.name).await.unwrap().is_none());
@@ -303,52 +329,60 @@ async fn oxia_implements_the_metadata_contract() {
     restarted.validate_initialized().await.unwrap();
     assert!(restarted.get_database("public").await.unwrap().is_none());
 
-    // Raw writes are test-only corruption injection. A duplicate index must fail
-    // closed instead of returning an arbitrary matching record.
     let root = restarted.get_user("lyrasys").await.unwrap().unwrap();
-    let value = Database {
-        name: "duplicate".into(),
-        owner_user_id: root.id(),
-        ..Default::default()
+    // Independent clients, not merely futures sharing one Engine's local mutex.
+    let mut writers = Vec::new();
+    for _ in 0..8 {
+        writers.push(OxiaMetadata::new(&options).await.unwrap());
     }
-    .encode_to_vec();
-    let first = raw
-        .put("/catalog/databases/x", value.clone())
+    let results = join_all(
+        writers
+            .iter()
+            .map(|writer| writer.create_database(Database::new("racing", root.id()))),
+    )
+    .await;
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert!(
+        results
+            .iter()
+            .all(|r| r.is_ok() || matches!(r, Err(MetadataError::AlreadyExists)))
+    );
+    let results = join_all(writers.iter().enumerate().map(|(i, writer)| {
+        writer.create_database(Database::new(format!("parallel-{i}"), root.id()))
+    }))
+    .await;
+    let ids: std::collections::HashSet<_> = results.into_iter().map(|r| r.unwrap().id()).collect();
+    assert_eq!(ids.len(), writers.len());
+    for writer in writers {
+        writer.close().await.unwrap();
+    }
+    // Key/value mismatch fails closed. Remove only this test's corrupt row.
+    let row = raw
+        .put(
+            "/catalog/databases/77726f6e67",
+            Database::new("mismatch", root.id()).encode_to_vec(),
+        )
         .partition_key("catalog")
-        .sequence_key_deltas([1])
-        .secondary_index("lyra.database.name", "duplicate")
+        .expected_record_not_exists()
         .await
         .unwrap();
-    let second = raw
-        .put("/catalog/databases/x", value)
-        .partition_key("catalog")
-        .sequence_key_deltas([1])
-        .secondary_index("lyra.database.name", "duplicate")
-        .await
-        .unwrap();
-    assert!(matches!(
-        restarted.get_database("duplicate").await,
-        Err(MetadataError::Integrity(_))
-    ));
     assert!(matches!(
         restarted.validate_initialized().await,
         Err(MetadataError::Integrity(_))
     ));
-    for row in [first, second] {
-        raw.delete(row.key)
-            .partition_key("catalog")
-            .expected_version_id(row.version.version_id)
-            .await
-            .unwrap();
-    }
+    raw.delete(row.key)
+        .partition_key("catalog")
+        .expected_version_id(row.version.version_id)
+        .await
+        .unwrap();
     restarted.validate_initialized().await.unwrap();
-    observe_tail_reuse(&restarted, root.id()).await;
+    assert_tail_non_reuse(&restarted, root.id()).await;
     registration_expiry(&restarted).await;
     restarted.close().await.unwrap();
     raw.close().await.unwrap();
 }
 
-async fn observe_tail_reuse(metadata: &dyn Metadata, owner: u32) {
+async fn assert_tail_non_reuse(metadata: &dyn Metadata, owner: u32) {
     let first = metadata
         .create_database(Database::new("tail-probe", owner))
         .await
@@ -361,13 +395,7 @@ async fn observe_tail_reuse(metadata: &dyn Metadata, owner: u32) {
         .create_database(Database::new("tail-probe", owner))
         .await
         .unwrap();
-    if first.id() == second.id() {
-        eprintln!(
-            "KNOWN OXIA LIMITATION: physically deleted database tail ID reused; non-reuse is NOT validated"
-        );
-    } else {
-        assert!(second.id() > first.id());
-    }
+    assert!(second.id() > first.id());
     metadata
         .delete_database(second.id(), second.version())
         .await
@@ -384,13 +412,7 @@ async fn observe_tail_reuse(metadata: &dyn Metadata, owner: u32) {
         .create_user("tail-probe", make_verifier("probe").unwrap())
         .await
         .unwrap();
-    if first.id() == second.id() {
-        eprintln!(
-            "KNOWN OXIA LIMITATION: physically deleted user tail ID reused; non-reuse is NOT validated"
-        );
-    } else {
-        assert!(second.id() > first.id());
-    }
+    assert!(second.id() > first.id());
     metadata
         .delete_user(second.id(), second.version())
         .await

@@ -8,7 +8,7 @@ use crate::metadata::{
     ComponentIdentity, Metadata, MetadataError, MetadataRecord, MetadataVersion, Registration,
     Result, UserInfo,
 };
-use crate::proto::pb_meta::{ComponentRegistration, Database, Instance, ScramSha256Verifier, User};
+use crate::proto::pb_meta::{ComponentRegistration, Database, Instance, ScramSha256Verifier};
 use async_trait::async_trait;
 use opentelemetry::metrics::Meter;
 use oxia::{GetResult, OxiaClient, OxiaError};
@@ -102,64 +102,6 @@ impl Storage for OxiaStorage {
             .into_iter()
             .map(row0)
             .collect())
-    }
-    async fn find(&self, index: &str, name: &str) -> Result<Vec<Row>> {
-        let first = match self
-            .client
-            .get(name)
-            .partition_key(PARTITION)
-            .use_index(index)
-            .await
-        {
-            Ok(row) => row,
-            Err(OxiaError::KeyNotFound) => return Ok(Vec::new()),
-            Err(error) => return Err(error0(error)),
-        };
-        // A bounded prefix range captures every exact match (not just Get's first
-        // match). Filter the secondary key, so neighboring/prefix names cannot
-        // be mistaken for duplicates. The end is a valid UTF-8 upper suffix.
-        let end = format!("{name}\u{10ffff}");
-        let records = self
-            .client
-            .range_scan(name, end)
-            .partition_key(PARTITION)
-            .use_index(index)
-            .await?;
-        // Oxia RangeScan does not populate secondary_index_key. The exact Get
-        // establishes the first match; inspect the typed name for the remaining
-        // prefix candidates, and retain the exact match even if its value is
-        // corrupt so the common validation layer can reject it.
-        let mut matches = vec![row0(first)];
-        for record in records {
-            if matches.iter().any(|row| row.key == record.key) {
-                continue;
-            }
-            let value = record.value.as_deref().unwrap_or_default();
-            let actual = match index {
-                "lyra.user.name" => User::decode(value)?.name,
-                "lyra.database.name" => Database::decode(value)?.name,
-                _ => return Err(MetadataError::InvalidRecord("unknown metadata index")),
-            };
-            if actual == name {
-                matches.push(row0(record));
-            }
-        }
-        Ok(matches)
-    }
-    async fn allocate(&self, prefix: &str, value: Vec<u8>, index: &str, name: &str) -> Result<Row> {
-        let record = self
-            .client
-            .put(prefix, value.clone())
-            .partition_key(PARTITION)
-            .sequence_key_deltas([1])
-            .secondary_index(index, name)
-            .await
-            .map_err(error0)?;
-        Ok(Row {
-            key: record.key,
-            value,
-            version: record.version.version_id,
-        })
     }
     async fn put(
         &self,

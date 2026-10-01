@@ -23,8 +23,6 @@ pub(crate) trait Storage: Send + Sync {
     fn backend(&self) -> &'static str;
     async fn get(&self, key: &str) -> Result<Option<Row>>;
     async fn scan(&self, first: &str, last: &str) -> Result<Vec<Row>>;
-    async fn find(&self, index: &str, name: &str) -> Result<Vec<Row>>;
-    async fn allocate(&self, prefix: &str, value: Vec<u8>, index: &str, name: &str) -> Result<Row>;
     async fn put(
         &self,
         key: &str,
