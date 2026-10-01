@@ -44,8 +44,11 @@ struct State {
     worker_alive: AtomicBool,
     cleanup_unconfirmed: AtomicBool,
     write_uncertain: AtomicBool,
+    backend_closed: AtomicBool,
+    backend_close_failed: AtomicBool,
     status: AtomicU8,
     gate: Mutex<()>,
+    close_gate: Mutex<()>,
     last_warning: StdMutex<Option<Instant>>,
 }
 
@@ -106,8 +109,11 @@ impl Monitor {
                 worker_alive: AtomicBool::new(false),
                 cleanup_unconfirmed: AtomicBool::new(false),
                 write_uncertain: AtomicBool::new(false),
+                backend_closed: AtomicBool::new(false),
+                backend_close_failed: AtomicBool::new(false),
                 status: AtomicU8::new(IDLE),
                 gate: Mutex::new(()),
+                close_gate: Mutex::new(()),
                 last_warning: StdMutex::new(None),
             }),
             thread: StdMutex::new(None),
@@ -147,7 +153,12 @@ impl Monitor {
                     }
                 };
                 state.worker_alive.store(true, Ordering::Release);
-                runtime.block_on(run(Arc::clone(&state), tx));
+                runtime.block_on(async {
+                    run(Arc::clone(&state), tx).await;
+                    // Oxia lazily starts batchers and session tasks on the
+                    // calling runtime. Drain them before this runtime drops.
+                    close_backend0(&state).await;
+                });
                 drop(guard);
             })
             .map_err(|_| MetadataError::RegistrationMonitorFailed)?;
@@ -231,6 +242,7 @@ impl Monitor {
         // Mark closing before cancellation or waiting for in-flight operations.
         self.state.closing.store(true, Ordering::Release);
         self.state.context.cancel();
+        let _close = self.state.close_gate.lock().await;
         let thread = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(thread) = thread {
             timeout(
@@ -242,12 +254,13 @@ impl Monitor {
             .map_err(|_| MetadataError::RegistrationMonitorFailed)?
             .map_err(|_| MetadataError::RegistrationMonitorFailed)?;
         }
-        // Session cleanup is retryable, including after cancelled close().
-        let closed = timeout(Duration::from_secs(2), self.state.store.close())
-            .await
-            .map_err(|_| MetadataError::Timeout)?;
-        closed?;
-        if self.state.cleanup_unconfirmed.load(Ordering::Acquire) {
+        // Unregistered clients have no worker and close on the caller runtime.
+        if !self.state.backend_closed.load(Ordering::Acquire) {
+            close_backend0(&self.state).await;
+        }
+        if self.state.cleanup_unconfirmed.load(Ordering::Acquire)
+            || self.state.backend_close_failed.load(Ordering::Acquire)
+        {
             // Closing the local SDK is not proof that an uncertain remote delete
             // succeeded. Session expiry remains the final fallback.
             Err(MetadataError::Timeout)
@@ -255,6 +268,16 @@ impl Monitor {
             Ok(())
         }
     }
+}
+
+async fn close_backend0(state: &State) {
+    let closed = timeout(Duration::from_secs(2), state.store.close()).await;
+    if !matches!(closed, Ok(Ok(()))) {
+        // SDK close may return success on a later call even if its first close
+        // failed. Retain uncertainty instead of falsely claiming clean shutdown.
+        state.backend_close_failed.store(true, Ordering::Release);
+    }
+    state.backend_closed.store(true, Ordering::Release);
 }
 
 impl Drop for Monitor {
