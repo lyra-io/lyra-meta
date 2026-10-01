@@ -10,6 +10,7 @@ use tracing::{Event, Subscriber};
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
 use tracing_subscriber::{
     EnvFilter, Layer, Registry,
+    filter::filter_fn,
     fmt::{
         FmtContext, FormatEvent, FormatFields,
         format::{self, Writer},
@@ -99,6 +100,16 @@ impl Logging {
             .boxed();
         let (console, handle): (_, ConsoleReload) = reload::Layer::new(None::<DynamicLayer>);
         // Layers remain at the same Registry type, allowing independent reloads.
+        // Register the filter once, outside reload: inserting a new Filtered
+        // layer later would not run on_layer() to allocate its FilterId.
+        let console = console.with_filter(filter_fn(|metadata| {
+            metadata.target().starts_with("tokio")
+                || if metadata.is_event() {
+                    metadata.target().starts_with("runtime")
+                } else {
+                    metadata.name().starts_with("runtime.")
+                }
+        }));
         let layers: Vec<DynamicLayer> = vec![log, console.boxed()];
         tracing_subscriber::registry()
             .with(layers)
