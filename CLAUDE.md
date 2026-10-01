@@ -64,3 +64,29 @@ Meta owns storage/lifecycle contracts, protobuf, shared configuration, the reusa
 and opt-in observability. Constructing a metadata client must not initialize global telemetry.
 Registration notifications and recovery remain private; no public lease handle/subscription.
 The vendored pprof source retains upstream style; keep local patches narrowly documented.
+
+## Layout and validation
+
+- `src/metadata` owns backend-independent lifecycle and the Memory/Oxia implementations;
+  `proto` owns durable and discovery messages; `src/toolkit.rs` owns manifest watching;
+  `src/config.rs` and `src/observability` own shared settings and instrumentation.
+- Use Rust 1.92 with `protoc`, `pkg-config`, and OpenSSL development headers.
+  Keep the checked-in `tokio_unstable` compiler setting and `Cargo.lock`.
+- Run `cargo fmt --all -- --check`, `cargo test --locked --all-features`, and
+  `cargo clippy --locked --all-features --all-targets --no-deps -- -D warnings`.
+- Build the Linux profiling and real-backend test image with
+  `docker build -f Dockerfile.validation -t mattison/lyra-meta-validation:lip0000-mvp .`.
+  Run it as a one-shot Job with an explicit `OXIA_SERVICE_ADDRESS` and a fresh,
+  provisioned `LYRA_TEST_NAMESPACE` beginning with `lyra-test-`. Never use a live
+  namespace for this test. Remove only its disposable namespace/resources afterward.
+- Follow approved LIP-0000. New SQL lifecycle features, privilege policy, migration,
+  and automatic operator recovery are not part of this foundation.
+- Never print or commit passwords, SCRAM verifiers, Secret payloads, or kubeconfigs.
+  Never reset metadata or delete a retained cluster/PVC to make a test pass.
+
+## Shared conventions
+
+The shared rules are under review in [lyra-io/conventions](https://github.com/lyra-io/conventions).
+Do not treat an unmerged draft as approved policy. Once approved, adopt the shared
+rules in a reviewed instructions change: explicitly read the applicable shared files,
+retain component-specific instructions, and remove duplicated policy.
