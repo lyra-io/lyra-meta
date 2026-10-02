@@ -1,7 +1,7 @@
 # Lyra Meta Instructions
 
-`lyra-meta` is Lyra's shared metadata library. This branch establishes a clean,
-dependency-free Rust scaffold; it does not implement metadata or runtime behavior.
+`lyra-meta` is Lyra's shared metadata library. It currently exposes lifecycle
+Protobuf contracts; storage and runtime behavior are introduced separately.
 Do not add a README. `CLAUDE.md` is the instruction entry point, and `AGENTS.md`
 must remain a tracked relative symlink to it.
 
@@ -21,10 +21,20 @@ reviewed change; do not copy the shared policy here or silently change revisions
 ## Layout and validation
 
 - `src/lib.rs` is the library entry point; add modules only with their scoped implementation.
+- `proto/pb_meta.proto` defines lifecycle wire contracts; `build.rs` generates
+  Rust types into Cargo's `OUT_DIR`. Do not check generated output into source.
+- `src/proto/mod.rs` exposes the generated types; `tests/protobuf.rs` checks
+  field presence, wire tags, unknown fields, and malformed encoding.
 - `Cargo.toml` declares the crate; keep `Cargo.lock` tracked.
 - `rust-toolchain.toml` pins Rust 1.92.0 with rustfmt and Clippy.
-- `.github/workflows/ci.yml` checks the scaffold on Linux.
+- `.github/workflows/ci.yml` checks the crate on Linux.
 - Preserve `LICENSE`.
+
+Install `protoc` before building (`brew install protobuf` on macOS or
+`apt-get install protobuf-compiler` on Debian/Ubuntu). An alternate compiler can
+be selected with `PROTOC`. Keep `prost` and `prost-build` on the same release line.
+The current line is 0.13, matching the reference MVP. Generated optional-field
+getters may hide absence; metadata validation must inspect the fields directly.
 
 Run from the repository root:
 
@@ -32,13 +42,15 @@ Run from the repository root:
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo package --locked
 git diff --check
 ```
 
-The scaffold has no behavioral tests. A successful build is not evidence of
-metadata correctness. No Oxia, protobuf compiler, Docker, Kubernetes, credentials,
-or deployment is required for these checks.
+These checks validate wire contracts, not metadata correctness. Protobuf decoding
+alone does not reject an absent initialization flag or component discriminator;
+metadata-level validation belongs with the typed API. No Oxia, Docker,
+Kubernetes, credentials, or deployment is required for these checks.
 
 ## Implementation boundaries
 

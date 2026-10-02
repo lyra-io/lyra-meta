@@ -1,4 +1,6 @@
 //! Shared metadata foundation for Lyra.
 //!
-//! This initialization scaffold intentionally exposes no runtime API.
-//! Metadata contracts and implementations are introduced in subsequent changes.
+//! Lifecycle Protobuf contracts are available in [`proto::pb_meta`]. Storage,
+//! initialization, and registration behavior are introduced separately.
+
+pub mod proto;
