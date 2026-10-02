@@ -24,7 +24,7 @@ reviewed change; do not copy the shared policy here or silently change revisions
 - `Cargo.toml` declares the crate; keep `Cargo.lock` tracked.
 - `rust-toolchain.toml` pins Rust 1.92.0 with rustfmt and Clippy.
 - `.github/workflows/ci.yml` checks the scaffold on Linux.
-- Preserve `LICENSE`, `logo.svg`, and `logo.png`.
+- Preserve `LICENSE`.
 
 Run from the repository root:
 
