@@ -1,4 +1,3 @@
-use super::allocator::{CounterRecord, CounterStore, IdKind, allocate_id};
 use super::validation::decode_instance;
 use super::{Metadata, MetadataError, Result};
 use crate::proto::pb_meta::Instance;
@@ -6,6 +5,9 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+const DATABASE_ID_KEY: &str = "/catalog/allocator/database";
+const USER_ID_KEY: &str = "/catalog/allocator/user";
 
 /// In-memory metadata client for contract tests and local development.
 ///
@@ -24,7 +26,7 @@ pub struct MemoryMetadata {
 
     // Mutable state
     instance: RwLock<Option<Vec<u8>>>,
-    counters: RwLock<BTreeMap<&'static str, CounterRecord>>,
+    counters: RwLock<BTreeMap<&'static str, Vec<u8>>>,
 }
 
 impl MemoryMetadata {
@@ -39,6 +41,27 @@ impl MemoryMetadata {
         } else {
             Ok(())
         }
+    }
+
+    fn allocate_id0(&self, key: &'static str) -> Result<u32> {
+        self.check_open0()?;
+        let mut counters = self
+            .counters
+            .write()
+            .map_err(|_| MetadataError::MemoryStatePoisoned)?;
+        self.check_open0()?;
+        // Keep the whole read/check/increment/write under one lock. Memory needs
+        // neither transport revisions nor a CAS retry loop, and no guard crosses
+        // an await. Invalid/exhausted values are rejected before any mutation.
+        let previous = match counters.get(key) {
+            None => 0,
+            Some(bytes) => u32::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
+                MetadataError::InvalidRecord("allocator value must contain exactly four bytes")
+            })?),
+        };
+        let next = previous.checked_add(1).ok_or(MetadataError::IdExhausted)?;
+        counters.insert(key, next.to_be_bytes().to_vec());
+        Ok(next)
     }
 }
 
@@ -60,61 +83,16 @@ impl Metadata for MemoryMetadata {
     }
 
     async fn allocate_database_id(&self) -> Result<u32> {
-        allocate_id(self, IdKind::Database).await
+        self.allocate_id0(DATABASE_ID_KEY)
     }
 
     async fn allocate_user_id(&self) -> Result<u32> {
-        allocate_id(self, IdKind::User).await
+        self.allocate_id0(USER_ID_KEY)
     }
 
     async fn close(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
         Ok(())
-    }
-}
-
-#[async_trait]
-impl CounterStore for MemoryMetadata {
-    async fn fetch_counter(&self, kind: IdKind) -> Result<Option<CounterRecord>> {
-        self.check_open0()?;
-        let counters = self
-            .counters
-            .read()
-            .map_err(|_| MetadataError::MemoryStatePoisoned)?;
-        self.check_open0()?;
-        Ok(counters.get(kind.key()).cloned())
-    }
-
-    async fn store_counter(
-        &self,
-        kind: IdKind,
-        expected_version: Option<i64>,
-        value: [u8; 4],
-    ) -> Result<bool> {
-        self.check_open0()?;
-        let mut counters = self
-            .counters
-            .write()
-            .map_err(|_| MetadataError::MemoryStatePoisoned)?;
-        self.check_open0()?;
-        let current_version = counters.get(kind.key()).map(|record| record.version);
-        if current_version != expected_version {
-            return Ok(false);
-        }
-        let version = match current_version {
-            None => 0,
-            Some(version) => version.checked_add(1).ok_or(MetadataError::InvalidRecord(
-                "allocator backend revision is exhausted",
-            ))?,
-        };
-        counters.insert(
-            kind.key(),
-            CounterRecord {
-                value: value.to_vec(),
-                version,
-            },
-        );
-        Ok(true)
     }
 }
 
@@ -219,123 +197,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn counters_use_create_only_and_version_conditional_writes() {
+    async fn counters_use_separate_exact_keys_and_four_byte_values() {
         let metadata = MemoryMetadata::new();
-        assert!(
-            metadata
-                .fetch_counter(IdKind::Database)
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            metadata
-                .store_counter(IdKind::Database, None, [0, 0, 0, 41])
-                .await
-                .unwrap()
-        );
-        assert!(
-            !metadata
-                .store_counter(IdKind::Database, None, [0, 0, 0, 1])
-                .await
-                .unwrap()
-        );
-        let first = metadata
-            .fetch_counter(IdKind::Database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(first.value, [0, 0, 0, 41]);
-        assert_eq!(first.version, 0);
-
-        assert_eq!(metadata.allocate_database_id().await.unwrap(), 42);
-        assert!(
-            !metadata
-                .store_counter(IdKind::Database, Some(first.version), [0, 0, 0, 99])
-                .await
-                .unwrap()
-        );
-        let second = metadata
-            .fetch_counter(IdKind::Database)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(second.value, [0, 0, 0, 42]);
-        assert_eq!(second.version, 1);
+        assert!(metadata.counters.read().unwrap().is_empty());
+        assert_eq!(metadata.allocate_database_id().await.unwrap(), 1);
+        assert_eq!(metadata.allocate_database_id().await.unwrap(), 2);
         assert_eq!(metadata.allocate_user_id().await.unwrap(), 1);
-        assert_eq!(metadata.counters.read().unwrap().len(), 2);
+        let counters = metadata.counters.read().unwrap();
+        assert_eq!(counters.len(), 2);
+        assert_eq!(counters["/catalog/allocator/database"], [0, 0, 0, 2]);
+        assert_eq!(counters["/catalog/allocator/user"], [0, 0, 0, 1]);
+    }
+
+    #[tokio::test]
+    async fn allocation_reads_and_writes_big_endian_counters() {
+        let metadata = MemoryMetadata::new();
+        for (bytes, expected) in [
+            ([0, 0, 0, 0], 1u32),
+            ([0, 0, 0, 1], 2),
+            ([0, 0, 0, 255], 256),
+            ([0, 0, 255, 255], 65536),
+            ([1, 2, 3, 4], 0x01020305),
+            ([255, 255, 255, 254], u32::MAX),
+        ] {
+            metadata
+                .counters
+                .write()
+                .unwrap()
+                .insert(DATABASE_ID_KEY, bytes.to_vec());
+            assert_eq!(metadata.allocate_database_id().await.unwrap(), expected);
+            assert_eq!(
+                metadata.counters.read().unwrap()[DATABASE_ID_KEY],
+                expected.to_be_bytes()
+            );
+        }
     }
 
     #[tokio::test]
     async fn invalid_and_exhausted_counters_are_not_repaired_or_wrapped() {
         let metadata = MemoryMetadata::new();
-        for bytes in [vec![], vec![0], vec![0; 3], vec![0; 5]] {
-            let record = CounterRecord {
-                value: bytes,
-                version: 17,
-            };
+        for length in [0, 1, 2, 3, 5, 8] {
+            let bytes = vec![0; length];
             metadata
                 .counters
                 .write()
                 .unwrap()
-                .insert(IdKind::Database.key(), record.clone());
+                .insert(DATABASE_ID_KEY, bytes.clone());
             assert!(matches!(
                 metadata.allocate_database_id().await,
                 Err(MetadataError::InvalidRecord(_))
             ));
-            assert_eq!(
-                metadata.fetch_counter(IdKind::Database).await.unwrap(),
-                Some(record)
-            );
+            assert_eq!(metadata.counters.read().unwrap()[DATABASE_ID_KEY], bytes);
         }
-        metadata.counters.write().unwrap().insert(
-            IdKind::Database.key(),
-            CounterRecord {
-                value: (u32::MAX - 1).to_be_bytes().to_vec(),
-                version: 18,
-            },
-        );
+        metadata
+            .counters
+            .write()
+            .unwrap()
+            .insert(DATABASE_ID_KEY, (u32::MAX - 1).to_be_bytes().to_vec());
         assert_eq!(metadata.allocate_database_id().await.unwrap(), u32::MAX);
-        let final_record = metadata.fetch_counter(IdKind::Database).await.unwrap();
-        assert_eq!(final_record.as_ref().unwrap().value, [255; 4]);
+        assert_eq!(metadata.counters.read().unwrap()[DATABASE_ID_KEY], [255; 4]);
         for _ in 0..2 {
             assert!(matches!(
                 metadata.allocate_database_id().await,
                 Err(MetadataError::IdExhausted)
             ));
-            assert_eq!(
-                metadata.fetch_counter(IdKind::Database).await.unwrap(),
-                final_record
-            );
+            assert_eq!(metadata.counters.read().unwrap()[DATABASE_ID_KEY], [255; 4]);
         }
         // An exhausted database domain does not exhaust the separate user domain.
         assert_eq!(metadata.allocate_user_id().await.unwrap(), 1);
     }
 
     #[tokio::test]
-    async fn backend_revision_overflow_does_not_change_counter_bytes() {
-        let metadata = MemoryMetadata::new();
-        let record = CounterRecord {
-            value: 1u32.to_be_bytes().to_vec(),
-            version: i64::MAX,
-        };
-        metadata
-            .counters
-            .write()
-            .unwrap()
-            .insert(IdKind::User.key(), record.clone());
-        assert!(matches!(
-            metadata.allocate_user_id().await,
-            Err(MetadataError::InvalidRecord(_))
-        ));
-        assert_eq!(
-            metadata.fetch_counter(IdKind::User).await.unwrap(),
-            Some(record)
-        );
-    }
-
-    #[tokio::test]
-    async fn close_retains_counters_and_rejects_reads_and_writes() {
+    async fn close_retains_counters_and_rejects_allocation() {
         let metadata = MemoryMetadata::new();
         assert_eq!(metadata.allocate_database_id().await.unwrap(), 1);
         assert_eq!(metadata.allocate_user_id().await.unwrap(), 1);
@@ -348,12 +281,6 @@ mod tests {
         ));
         assert!(matches!(
             metadata.allocate_user_id().await,
-            Err(MetadataError::Closed)
-        ));
-        assert!(matches!(
-            metadata
-                .store_counter(IdKind::User, Some(0), [0, 0, 0, 2])
-                .await,
             Err(MetadataError::Closed)
         ));
         assert_eq!(*metadata.counters.read().unwrap(), before);

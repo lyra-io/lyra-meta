@@ -1,7 +1,6 @@
 //! Typed metadata operations. Memory is for testing, not a durable backend or
 //! an automatic fallback when a durable backend is unavailable.
 
-mod allocator;
 mod api;
 mod error;
 mod memory;

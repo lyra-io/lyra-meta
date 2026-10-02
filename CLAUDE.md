@@ -55,13 +55,13 @@ reviewed change; do not copy the shared policy here or silently change revisions
   `MemoryMetadata`. Its current methods are `fetch_instance`, `is_initialized`,
   `allocate_database_id`, `allocate_user_id`, and `close`; add other methods only
   with their implementations and tests.
-- `src/metadata/allocator.rs` owns four-byte big-endian counter encoding and the
-  bounded conditional-write loop. Its counter transport, keys, and backend
-  revisions stay private. Only confirmed conflicts are retried; all other errors
-  stop the attempt without inferring ID ownership from read-back.
+- Keep ID allocation directly in each metadata implementation, not in a separate
+  allocator module or counter-transport abstraction. `MemoryMetadata` reads,
+  checks, increments, and stores the four-byte counter under one write lock;
+  it needs no transport revisions or retry loop. Never hold a guard across await.
 - `tests/id_allocation.rs` checks separate domains, shared-client uniqueness, and
-  close races. Unit tests inject malformed counters, stale revisions, contention,
-  and failures including a lost write reply. Memory counters are not durable;
+  close races. Memory unit tests cover exact keys/bytes, malformed/exhausted
+  counters, lock poisoning, and preservation on error/close. Counters are not durable;
   construction starts an isolated empty namespace and dropping it loses its data.
 - `tests/metadata.rs` checks the public trait-object and client-lifecycle contract.
   Memory unit tests inject raw records privately; do not expose a public marker
@@ -110,6 +110,8 @@ or deployment is required for these checks.
   Durable storage/bootstrap integration is still separate: validate counter and
   object-ID consistency, and reject missing counters alongside existing records
   rather than using first-allocation behavior to repair an existing deployment.
+  Implement and test Oxia-specific CAS, conflicts, and uncertain write outcomes
+  directly in the Oxia metadata implementation when that backend is introduced.
 - Keep metadata/storage operations separate from reusable configuration, manifest
   watching, and explicit opt-in process observability when those features arrive.
 - Removing the previous API is intentional. Consumers must remain pinned to their

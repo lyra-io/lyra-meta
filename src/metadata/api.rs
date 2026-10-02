@@ -33,15 +33,15 @@ pub trait Metadata: Send + Sync {
     /// Reserve the next nonzero database ID without creating a database record.
     ///
     /// Database and user counters are independent. A missing counter starts at
-    /// one through a create-only write; existing counters advance conditionally.
+    /// one; reading, incrementing, and storing the counter is atomic with respect
+    /// to concurrent allocations within the backend's shared state.
     /// An ID is returned only after this call's write is confirmed. Failed or
     /// cancelled calls may consume IDs; IDs are not promised to be gapless and
     /// must never be reclaimed or counters reset when records are deleted.
     ///
     /// Malformed counters are errors, never a reason to reset to zero. Exhaustion
-    /// returns [`MetadataError::IdExhausted`] without wrapping. A bounded run of
-    /// conflicting writes returns [`MetadataError::AllocationContended`]; callers
-    /// may retry that error. Other errors propagate without automatic write retry.
+    /// returns [`MetadataError::IdExhausted`] without wrapping. Other errors
+    /// propagate without repairing or resetting the counter.
     /// Memory guarantees uniqueness only within its shared client state; it is
     /// not durable storage. No counter/key/version API is exposed to callers.
     async fn allocate_database_id(&self) -> Result<u32>;

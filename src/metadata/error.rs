@@ -16,9 +16,6 @@ pub enum MetadataError {
     /// The counter has issued every nonzero `u32` ID; it must not wrap or reset.
     #[error("object ID counter is exhausted")]
     IdExhausted,
-    /// Every conditional write in this bounded attempt conflicted; retry is safe.
-    #[error("object ID allocation is contended; retry the operation")]
-    AllocationContended,
     /// A writer panicked while holding the in-memory state lock.
     #[error("in-memory metadata state is poisoned")]
     MemoryStatePoisoned,
