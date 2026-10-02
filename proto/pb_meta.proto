@@ -8,6 +8,37 @@ message Instance {
   optional bool initialized = 1;
 }
 
+// Bootstrap database identity at `/catalog/databases/<name-key>` (partition: `catalog`).
+// Database management policies and lifecycle operations are outside this contract.
+message Database {
+  reserved 3 to 5;
+
+  string name = 1;
+  uint32 owner_user_id = 2;
+  // Nonzero database identity, assigned by metadata rather than the caller.
+  uint32 id = 6;
+}
+
+// Ordinary user record at `/catalog/users/<name-key>` (partition: `catalog`).
+// This stored message contains credentials; it is not a public user inventory.
+message User {
+  string name = 1;
+  ScramSha256Verifier password_verifier = 2;
+  // Nonzero user identity, allocated separately from database identities.
+  uint32 id = 3;
+}
+
+// Private authentication material, never raw password text. Do not expose this
+// value through SQL, logs, or metrics. Debug formatting is deliberately redacted;
+// Protobuf encoding still contains the real fields and must be treated as secret.
+// Derivation and validation of these fields belong to the credential layer.
+message ScramSha256Verifier {
+  bytes salt = 1;
+  uint32 iterations = 2;
+  bytes stored_key = 3;
+  bytes server_key = 4;
+}
+
 // Ephemeral presence at `/discovery/<component-type>/instances/<registration-uuid>`.
 // The UUID belongs only in the key, never in this value. The selected kind must
 // agree with the key's component type. An unset kind is invalid metadata.

@@ -1,8 +1,9 @@
 # Lyra Meta Instructions
 
-`lyra-meta` is Lyra's shared metadata library. It currently exposes lifecycle
-Protobuf contracts and typed, Memory-backed initialization reads. Bootstrap writes,
-durable storage, and component registration are introduced separately.
+`lyra-meta` is Lyra's shared metadata library. It currently exposes bootstrap and
+component registration Protobuf contracts and typed, Memory-backed initialization
+reads. Bootstrap writes, durable storage, and registration operations are introduced
+separately.
 Do not add a README. `CLAUDE.md` is the instruction entry point, and `AGENTS.md`
 must remain a tracked relative symlink to it.
 
@@ -22,10 +23,20 @@ reviewed change; do not copy the shared policy here or silently change revisions
 ## Layout and validation
 
 - `src/lib.rs` is the library entry point; add modules only with their scoped implementation.
-- `proto/pb_meta.proto` defines lifecycle wire contracts; `build.rs` generates
-  Rust types into Cargo's `OUT_DIR`. Do not check generated output into source.
+- `proto/pb_meta.proto` defines bootstrap and component registration wire contracts;
+  `build.rs` generates Rust types into Cargo's `OUT_DIR`. Do not check generated
+  output into source.
 - `src/proto/mod.rs` exposes the generated types; `tests/protobuf.rs` checks
   field presence, wire tags, unknown fields, and malformed encoding.
+- `tests/bootstrap_protobuf.rs` covers user/database/verifier wire
+  contracts. Keep retained field numbers stable and do not reuse reserved tags.
+  Database records contain only name, ID, and owner user ID. Introduce database
+  management policies and lifecycle state with their separately reviewed behavior,
+  not as bootstrap placeholders. Generated getters can hide absent options;
+  inspect raw fields.
+- `src/proto/redacted.rs` supplies redacted `Debug` implementations for `User`
+  and `ScramSha256Verifier`; keep their generated debug output disabled in
+  `build.rs`. Redaction does not sanitize field access or serialized bytes.
 - `src/metadata` owns the `Metadata` trait, typed errors, marker validation, and
   `MemoryMetadata`. Its current methods are `fetch_instance`, `is_initialized`,
   and `close`; add other methods only with their implementations and tests.
@@ -68,6 +79,11 @@ Kubernetes, credentials, or deployment is required for these checks.
   splitting the implementation, not a change to merge wholesale or copy blindly.
 - Add dependencies, schemas, backends, background workers, and observability only
   alongside the feature and its tests. Do not add speculative placeholder APIs.
+- Implement ID allocation in a separate change, using exactly four big-endian
+  bytes for a `u32` counter at `/catalog/allocator/user` and
+  `/catalog/allocator/database`, not a Protobuf wrapper. Add the codec, conditional
+  allocation, and tests together; reject malformed values and overflow, and never
+  reset counters when records are deleted. Allocation is not implemented yet.
 - Keep metadata/storage operations separate from reusable configuration, manifest
   watching, and explicit opt-in process observability when those features arrive.
 - Removing the previous API is intentional. Consumers must remain pinned to their
