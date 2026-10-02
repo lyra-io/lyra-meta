@@ -8,6 +8,54 @@ message Instance {
   optional bool initialized = 1;
 }
 
+// Ordinary database record at `/catalog/databases/<name-key>` (partition: `catalog`).
+// Keep the reference record format; name-key encoding is not redesigned here.
+message Database {
+  string name = 1;
+  uint32 owner_user_id = 2;
+  // Metadata interprets absence as true / -1, respectively. Zero is a valid
+  // connection limit. Inspect presence rather than generated scalar getters.
+  optional bool allow_connections = 3;
+  optional sint32 connection_limit = 4;
+  DatabaseState state = 5;
+  // Nonzero database identity, assigned by metadata rather than the caller.
+  uint32 id = 6;
+}
+
+// Retain the reference wire values; database lifecycle operations are separate.
+enum DatabaseState {
+  READY = 0;
+  DROPPING = 1;
+  DROP_FAILED = 2;
+}
+
+// Ordinary user record at `/catalog/users/<name-key>` (partition: `catalog`).
+// This stored message contains credentials; it is not a public user inventory.
+message User {
+  string name = 1;
+  ScramSha256Verifier password_verifier = 2;
+  // Nonzero user identity, allocated separately from database identities.
+  uint32 id = 3;
+}
+
+// Durable high-water mark at `/catalog/allocator/user` or
+// `/catalog/allocator/database` (partition: `catalog`). Allocation will advance
+// this value with version-conditional writes, never by deleting or resetting it.
+message Allocator {
+  uint32 last_allocated = 1;
+}
+
+// Private authentication material, never raw password text. Do not expose this
+// value through SQL, logs, or metrics. Debug formatting is deliberately redacted;
+// Protobuf encoding still contains the real fields and must be treated as secret.
+// Derivation and validation of these fields belong to the credential layer.
+message ScramSha256Verifier {
+  bytes salt = 1;
+  uint32 iterations = 2;
+  bytes stored_key = 3;
+  bytes server_key = 4;
+}
+
 // Ephemeral presence at `/discovery/<component-type>/instances/<registration-uuid>`.
 // The UUID belongs only in the key, never in this value. The selected kind must
 // agree with the key's component type. An unset kind is invalid metadata.

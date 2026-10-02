@@ -1,6 +1,6 @@
 # Lyra Meta Instructions
 
-`lyra-meta` is Lyra's shared metadata library. It currently exposes lifecycle
+`lyra-meta` is Lyra's shared metadata library. It currently exposes lifecycle/bootstrap
 Protobuf contracts and typed, Memory-backed initialization reads. Bootstrap writes,
 durable storage, and component registration are introduced separately.
 Do not add a README. `CLAUDE.md` is the instruction entry point, and `AGENTS.md`
@@ -22,10 +22,16 @@ reviewed change; do not copy the shared policy here or silently change revisions
 ## Layout and validation
 
 - `src/lib.rs` is the library entry point; add modules only with their scoped implementation.
-- `proto/pb_meta.proto` defines lifecycle wire contracts; `build.rs` generates
+- `proto/pb_meta.proto` defines lifecycle/bootstrap wire contracts; `build.rs` generates
   Rust types into Cargo's `OUT_DIR`. Do not check generated output into source.
 - `src/proto/mod.rs` exposes the generated types; `tests/protobuf.rs` checks
   field presence, wire tags, unknown fields, and malformed encoding.
+- `tests/bootstrap_protobuf.rs` covers user/database/allocator/verifier wire
+  contracts. Keep reference field numbers and enum values stable. Generated
+  getters can hide absent options or unknown enum values; inspect raw fields.
+- `src/proto/redacted.rs` supplies redacted `Debug` implementations for `User`
+  and `ScramSha256Verifier`; keep their generated debug output disabled in
+  `build.rs`. Redaction does not sanitize field access or serialized bytes.
 - `src/metadata` owns the `Metadata` trait, typed errors, marker validation, and
   `MemoryMetadata`. Its current methods are `fetch_instance`, `is_initialized`,
   and `close`; add other methods only with their implementations and tests.
