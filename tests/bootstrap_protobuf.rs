@@ -1,4 +1,4 @@
-use lyra_meta::proto::pb_meta::{Allocator, Database, ScramSha256Verifier, User};
+use lyra_meta::proto::pb_meta::{Database, ScramSha256Verifier, User};
 use prost::Message;
 
 #[test]
@@ -15,19 +15,6 @@ fn database_preserves_identity_and_ownership_wire_tags() {
     ];
     assert_eq!(record.encode_to_vec(), bytes);
     assert_eq!(Database::decode(bytes.as_slice()).unwrap(), record);
-}
-
-#[test]
-fn allocator_preserves_zero_and_full_u32_high_water_mark() {
-    for (last_allocated, bytes) in [
-        (0, vec![]),
-        (1, vec![0x08, 0x01]),
-        (u32::MAX, vec![0x08, 0xff, 0xff, 0xff, 0xff, 0x0f]),
-    ] {
-        let record = Allocator { last_allocated };
-        assert_eq!(record.encode_to_vec(), bytes);
-        assert_eq!(Allocator::decode(bytes.as_slice()).unwrap(), record);
-    }
 }
 
 #[test]
@@ -87,13 +74,6 @@ fn unknown_fields_do_not_erase_known_bootstrap_fields() {
     bytes.extend(suffix);
     assert_eq!(User::decode(bytes.as_slice()).unwrap().id, 7);
 
-    let mut bytes = vec![0x08, 0x05];
-    bytes.extend(suffix);
-    assert_eq!(
-        Allocator::decode(bytes.as_slice()).unwrap().last_allocated,
-        5
-    );
-
     let mut bytes = vec![0x10, 0x80, 0x20];
     bytes.extend(suffix);
     assert_eq!(
@@ -112,9 +92,6 @@ fn malformed_bootstrap_records_fail_wire_decoding() {
     }
     // A malformed nested verifier must fail the enclosing user too.
     assert!(User::decode([0x12, 0x01, 0x00].as_slice()).is_err());
-    for bytes in [&[0x00][..], &[0x08][..], &[0x0a, 0x00][..]] {
-        assert!(Allocator::decode(bytes).is_err());
-    }
     for bytes in [&[0x00][..], &[0x0a, 0x01][..], &[0x10][..]] {
         assert!(ScramSha256Verifier::decode(bytes).is_err());
     }

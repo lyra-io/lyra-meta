@@ -28,7 +28,7 @@ reviewed change; do not copy the shared policy here or silently change revisions
   output into source.
 - `src/proto/mod.rs` exposes the generated types; `tests/protobuf.rs` checks
   field presence, wire tags, unknown fields, and malformed encoding.
-- `tests/bootstrap_protobuf.rs` covers user/database/allocator/verifier wire
+- `tests/bootstrap_protobuf.rs` covers user/database/verifier wire
   contracts. Keep retained field numbers stable and do not reuse reserved tags.
   Database records contain only name, ID, and owner user ID. Introduce database
   management policies and lifecycle state with their separately reviewed behavior,
@@ -79,6 +79,11 @@ Kubernetes, credentials, or deployment is required for these checks.
   splitting the implementation, not a change to merge wholesale or copy blindly.
 - Add dependencies, schemas, backends, background workers, and observability only
   alongside the feature and its tests. Do not add speculative placeholder APIs.
+- Implement ID allocation in a separate change, using exactly four big-endian
+  bytes for a `u32` counter at `/catalog/allocator/user` and
+  `/catalog/allocator/database`, not a Protobuf wrapper. Add the codec, conditional
+  allocation, and tests together; reject malformed values and overflow, and never
+  reset counters when records are deleted. Allocation is not implemented yet.
 - Keep metadata/storage operations separate from reusable configuration, manifest
   watching, and explicit opt-in process observability when those features arrive.
 - Removing the previous API is intentional. Consumers must remain pinned to their

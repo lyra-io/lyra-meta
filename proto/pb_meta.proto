@@ -28,13 +28,6 @@ message User {
   uint32 id = 3;
 }
 
-// Durable high-water mark at `/catalog/allocator/user` or
-// `/catalog/allocator/database` (partition: `catalog`). Allocation will advance
-// this value with version-conditional writes, never by deleting or resetting it.
-message Allocator {
-  uint32 last_allocated = 1;
-}
-
 // Private authentication material, never raw password text. Do not expose this
 // value through SQL, logs, or metrics. Debug formatting is deliberately redacted;
 // Protobuf encoding still contains the real fields and must be treated as secret.
