@@ -2,8 +2,8 @@
 
 `lyra-meta` is Lyra's shared metadata library. It currently exposes bootstrap and
 component registration Protobuf contracts, bootstrap credential helpers, and typed,
-Memory-backed initialization reads. Bootstrap writes, durable storage, and
-registration operations are introduced separately.
+Memory-backed initialization reads and ID reservation. Bootstrap writes, durable
+storage, and registration operations are introduced separately.
 Do not add a README. `CLAUDE.md` is the instruction entry point, and `AGENTS.md`
 must remain a tracked relative symlink to it.
 
@@ -53,7 +53,16 @@ reviewed change; do not copy the shared policy here or silently change revisions
   no-repair validation, serialization, and redaction using synthetic inputs only.
 - `src/metadata` owns the `Metadata` trait, typed errors, marker validation, and
   `MemoryMetadata`. Its current methods are `fetch_instance`, `is_initialized`,
-  and `close`; add other methods only with their implementations and tests.
+  `allocate_database_id`, `allocate_user_id`, and `close`; add other methods only
+  with their implementations and tests.
+- `src/metadata/allocator.rs` owns four-byte big-endian counter encoding and the
+  bounded conditional-write loop. Its counter transport, keys, and backend
+  revisions stay private. Only confirmed conflicts are retried; all other errors
+  stop the attempt without inferring ID ownership from read-back.
+- `tests/id_allocation.rs` checks separate domains, shared-client uniqueness, and
+  close races. Unit tests inject malformed counters, stale revisions, contention,
+  and failures including a lost write reply. Memory counters are not durable;
+  construction starts an isolated empty namespace and dropping it loses its data.
 - `tests/metadata.rs` checks the public trait-object and client-lifecycle contract.
   Memory unit tests inject raw records privately; do not expose a public marker
   setter that could bypass future bootstrap validation.
@@ -79,8 +88,8 @@ cargo package --locked
 git diff --check
 ```
 
-These checks cover wire contracts, credential helpers, and the implemented Memory
-read/close behavior, not authentication, durable storage, bootstrap writes, or
+These checks cover wire contracts, credential helpers, and Memory read/allocation/
+close behavior, not authentication, durable storage, bootstrap writes, or
 registration. Typed initialization reads reject an unset flag even though raw
 Protobuf decoding accepts it. Component validation will arrive with registration.
 Tokio is currently a test-only dependency; metadata construction must require no
@@ -94,11 +103,13 @@ or deployment is required for these checks.
   splitting the implementation, not a change to merge wholesale or copy blindly.
 - Add dependencies, schemas, backends, background workers, and observability only
   alongside the feature and its tests. Do not add speculative placeholder APIs.
-- Implement ID allocation in a separate change, using exactly four big-endian
-  bytes for a `u32` counter at `/catalog/allocator/user` and
-  `/catalog/allocator/database`, not a Protobuf wrapper. Add the codec, conditional
-  allocation, and tests together; reject malformed values and overflow, and never
-  reset counters when records are deleted. Allocation is not implemented yet.
+- ID allocation stores exactly four big-endian bytes for a `u32` counter at
+  `/catalog/allocator/user` and `/catalog/allocator/database`, not a Protobuf
+  wrapper. Reject malformed values and overflow; never reset counters when
+  records are deleted. IDs may have gaps after failed/cancelled operations.
+  Durable storage/bootstrap integration is still separate: validate counter and
+  object-ID consistency, and reject missing counters alongside existing records
+  rather than using first-allocation behavior to repair an existing deployment.
 - Keep metadata/storage operations separate from reusable configuration, manifest
   watching, and explicit opt-in process observability when those features arrive.
 - Removing the previous API is intentional. Consumers must remain pinned to their
