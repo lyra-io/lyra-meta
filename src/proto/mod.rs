@@ -1,4 +1,5 @@
 //! Generated wire types; no storage operations or metadata validation policy.
+//! Initialization record validation lives in [`crate::metadata`].
 
 /// Lifecycle records generated from `proto/pb_meta.proto`.
 ///

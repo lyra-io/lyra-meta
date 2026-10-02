@@ -1,7 +1,8 @@
 # Lyra Meta Instructions
 
 `lyra-meta` is Lyra's shared metadata library. It currently exposes lifecycle
-Protobuf contracts; storage and runtime behavior are introduced separately.
+Protobuf contracts and typed, Memory-backed initialization reads. Bootstrap writes,
+durable storage, and component registration are introduced separately.
 Do not add a README. `CLAUDE.md` is the instruction entry point, and `AGENTS.md`
 must remain a tracked relative symlink to it.
 
@@ -25,6 +26,12 @@ reviewed change; do not copy the shared policy here or silently change revisions
   Rust types into Cargo's `OUT_DIR`. Do not check generated output into source.
 - `src/proto/mod.rs` exposes the generated types; `tests/protobuf.rs` checks
   field presence, wire tags, unknown fields, and malformed encoding.
+- `src/metadata` owns the `Metadata` trait, typed errors, marker validation, and
+  `MemoryMetadata`. Its current methods are `fetch_instance`, `is_initialized`,
+  and `close`; add other methods only with their implementations and tests.
+- `tests/metadata.rs` checks the public trait-object and client-lifecycle contract.
+  Memory unit tests inject raw records privately; do not expose a public marker
+  setter that could bypass future bootstrap validation.
 - `Cargo.toml` declares the crate; keep `Cargo.lock` tracked.
 - `rust-toolchain.toml` pins Rust 1.92.0 with rustfmt and Clippy.
 - `.github/workflows/ci.yml` checks the crate on Linux.
@@ -47,9 +54,11 @@ cargo package --locked
 git diff --check
 ```
 
-These checks validate wire contracts, not metadata correctness. Protobuf decoding
-alone does not reject an absent initialization flag or component discriminator;
-metadata-level validation belongs with the typed API. No Oxia, Docker,
+These checks cover wire contracts and the implemented Memory read/close behavior,
+not durable storage, bootstrap, or registration. Typed initialization reads reject
+an unset flag even though raw Protobuf decoding accepts it. Component validation
+will arrive with registration. Tokio is currently a test-only dependency; metadata
+construction must require no runtime or process-global setup. No Oxia, Docker,
 Kubernetes, credentials, or deployment is required for these checks.
 
 ## Implementation boundaries

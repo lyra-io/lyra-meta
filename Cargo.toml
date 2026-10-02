@@ -8,7 +8,12 @@ repository = "https://github.com/lyra-io/lyra-meta"
 description = "Shared metadata foundation for Lyra."
 
 [dependencies]
+async-trait = "0.1"
 prost = "0.13.5"
+thiserror = "2"
 
 [build-dependencies]
 prost-build = "0.13.5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
