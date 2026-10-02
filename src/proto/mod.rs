@@ -3,16 +3,16 @@
 
 mod redacted;
 
-/// Lifecycle and bootstrap records generated from `proto/pb_meta.proto`.
+/// Bootstrap and component registration records generated from `proto/pb_meta.proto`.
 ///
 /// Protobuf decoding checks the wire format, not metadata validity. An unset
 /// initialization flag or component kind still requires rejection by the
 /// metadata layer. Read the optional fields directly to distinguish absence
 /// from an explicit value.
 ///
-/// User/database IDs, names, ownership, state, and verifier validity are not
-/// enforced by decoding. Inspect raw enum values with `DatabaseState::try_from`
-/// rather than accepting the generated getter's fallback for unknown values.
+/// User/database IDs, names, ownership, and verifier validity are not enforced
+/// by decoding. Database records contain bootstrap identity and ownership only;
+/// database management policies and lifecycle operations are not implemented.
 /// User and verifier debug output is redacted, but their encoded bytes and
 /// directly accessed fields still contain credential material.
 pub mod pb_meta {
