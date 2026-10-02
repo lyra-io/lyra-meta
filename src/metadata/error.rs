@@ -13,6 +13,9 @@ pub enum MetadataError {
     /// The message decodes but violates a required metadata invariant.
     #[error("invalid metadata record: {0}")]
     InvalidRecord(&'static str),
+    /// The counter has issued every nonzero `u32` ID; it must not wrap or reset.
+    #[error("object ID counter is exhausted")]
+    IdExhausted,
     /// A writer panicked while holding the in-memory state lock.
     #[error("in-memory metadata state is poisoned")]
     MemoryStatePoisoned,

@@ -4,8 +4,8 @@ use async_trait::async_trait;
 
 /// Object-safe metadata operations, shareable as `Arc<dyn Metadata>`.
 ///
-/// This slice defines initialization reads and local client closure. Bootstrap
-/// and registration methods are added with their implementations, not as stubs.
+/// This slice defines initialization reads, ID reservation, and client closure.
+/// Bootstrap and registration methods arrive with their implementations.
 /// Reads never initialize, repair, or otherwise mutate stored records.
 #[async_trait]
 pub trait Metadata: Send + Sync {
@@ -30,10 +30,33 @@ pub trait Metadata: Send + Sync {
         }
     }
 
-    /// Idempotently close this client without deleting stored records.
+    /// Reserve the next nonzero database ID without creating a database record.
     ///
-    /// Reads begun after successful closure return [`MetadataError::Closed`].
-    /// A read admitted before a concurrent close may finish with its snapshot.
+    /// Database and user counters are independent. A missing counter starts at
+    /// one; reading, incrementing, and storing the counter is atomic with respect
+    /// to concurrent allocations within the backend's shared state.
+    /// An ID is returned only after this call's write is confirmed. Failed or
+    /// cancelled calls may consume IDs; IDs are not promised to be gapless and
+    /// must never be reclaimed or counters reset when records are deleted.
+    ///
+    /// Malformed counters are errors, never a reason to reset to zero. Exhaustion
+    /// returns [`MetadataError::IdExhausted`] without wrapping. Other errors
+    /// propagate without repairing or resetting the counter.
+    /// Memory guarantees uniqueness only within its shared client state; it is
+    /// not durable storage. No counter/key/version API is exposed to callers.
+    async fn allocate_database_id(&self) -> Result<u32>;
+
+    /// Reserve the next nonzero user ID without creating a user record.
+    ///
+    /// Uses a separate counter with the same guarantees and failure semantics as
+    /// [`Self::allocate_database_id`]. Allocating IDs does not initialize metadata.
+    async fn allocate_user_id(&self) -> Result<u32>;
+
+    /// Idempotently close this client without deleting stored records or counters.
+    ///
+    /// Operations begun after successful closure return [`MetadataError::Closed`].
+    /// An operation admitted before a concurrent close may finish; a confirmed
+    /// allocation is never rolled back by closing the client.
     /// Closing one independently constructed client does not close another.
     async fn close(&self) -> Result<()>;
 }

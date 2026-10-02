@@ -2,8 +2,12 @@ use super::validation::decode_instance;
 use super::{Metadata, MetadataError, Result};
 use crate::proto::pb_meta::Instance;
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+const DATABASE_ID_KEY: &str = "/catalog/allocator/database";
+const USER_ID_KEY: &str = "/catalog/allocator/user";
 
 /// In-memory metadata client for contract tests and local development.
 ///
@@ -11,9 +15,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// when callers should observe the same state and closure. Construction requires
 /// no async runtime and creates no workers, listeners, or global telemetry.
 ///
-/// This slice exposes reads only. The initialization marker cannot be set through
-/// the public API; the later bootstrap implementation must validate all required
-/// records before publishing completion. Dropping this client discards its memory.
+/// This slice exposes marker reads and ID reservation, not record creation.
+/// The initialization marker cannot be set through the public API; the later
+/// bootstrap implementation must validate all required records before publishing
+/// completion. Dropping this client discards its memory.
 #[derive(Default)]
 pub struct MemoryMetadata {
     // Control state
@@ -21,6 +26,7 @@ pub struct MemoryMetadata {
 
     // Mutable state
     instance: RwLock<Option<Vec<u8>>>,
+    counters: RwLock<BTreeMap<&'static str, Vec<u8>>>,
 }
 
 impl MemoryMetadata {
@@ -35,6 +41,27 @@ impl MemoryMetadata {
         } else {
             Ok(())
         }
+    }
+
+    fn allocate_id0(&self, key: &'static str) -> Result<u32> {
+        self.check_open0()?;
+        let mut counters = self
+            .counters
+            .write()
+            .map_err(|_| MetadataError::MemoryStatePoisoned)?;
+        self.check_open0()?;
+        // Keep the whole read/check/increment/write under one lock. Memory needs
+        // neither transport revisions nor a CAS retry loop, and no guard crosses
+        // an await. Invalid/exhausted values are rejected before any mutation.
+        let previous = match counters.get(key) {
+            None => 0,
+            Some(bytes) => u32::from_be_bytes(bytes.as_slice().try_into().map_err(|_| {
+                MetadataError::InvalidRecord("allocator value must contain exactly four bytes")
+            })?),
+        };
+        let next = previous.checked_add(1).ok_or(MetadataError::IdExhausted)?;
+        counters.insert(key, next.to_be_bytes().to_vec());
+        Ok(next)
     }
 }
 
@@ -53,6 +80,14 @@ impl Metadata for MemoryMetadata {
         // Decode a snapshot without holding a lock. Never recover a poisoned
         // lock as an empty record or retain a blocking guard across an await.
         bytes.as_deref().map(decode_instance).transpose()
+    }
+
+    async fn allocate_database_id(&self) -> Result<u32> {
+        self.allocate_id0(DATABASE_ID_KEY)
+    }
+
+    async fn allocate_user_id(&self) -> Result<u32> {
+        self.allocate_id0(USER_ID_KEY)
     }
 
     async fn close(&self) -> Result<()> {
@@ -157,6 +192,121 @@ mod tests {
         metadata.close().await.unwrap();
         assert!(matches!(
             metadata.fetch_instance().await,
+            Err(MetadataError::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn counters_use_separate_exact_keys_and_four_byte_values() {
+        let metadata = MemoryMetadata::new();
+        assert!(metadata.counters.read().unwrap().is_empty());
+        assert_eq!(metadata.allocate_database_id().await.unwrap(), 1);
+        assert_eq!(metadata.allocate_database_id().await.unwrap(), 2);
+        assert_eq!(metadata.allocate_user_id().await.unwrap(), 1);
+        let counters = metadata.counters.read().unwrap();
+        assert_eq!(counters.len(), 2);
+        assert_eq!(counters["/catalog/allocator/database"], [0, 0, 0, 2]);
+        assert_eq!(counters["/catalog/allocator/user"], [0, 0, 0, 1]);
+    }
+
+    #[tokio::test]
+    async fn allocation_reads_and_writes_big_endian_counters() {
+        let metadata = MemoryMetadata::new();
+        for (bytes, expected) in [
+            ([0, 0, 0, 0], 1u32),
+            ([0, 0, 0, 1], 2),
+            ([0, 0, 0, 255], 256),
+            ([0, 0, 255, 255], 65536),
+            ([1, 2, 3, 4], 0x01020305),
+            ([255, 255, 255, 254], u32::MAX),
+        ] {
+            metadata
+                .counters
+                .write()
+                .unwrap()
+                .insert(DATABASE_ID_KEY, bytes.to_vec());
+            assert_eq!(metadata.allocate_database_id().await.unwrap(), expected);
+            assert_eq!(
+                metadata.counters.read().unwrap()[DATABASE_ID_KEY],
+                expected.to_be_bytes()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_and_exhausted_counters_are_not_repaired_or_wrapped() {
+        let metadata = MemoryMetadata::new();
+        for length in [0, 1, 2, 3, 5, 8] {
+            let bytes = vec![0; length];
+            metadata
+                .counters
+                .write()
+                .unwrap()
+                .insert(DATABASE_ID_KEY, bytes.clone());
+            assert!(matches!(
+                metadata.allocate_database_id().await,
+                Err(MetadataError::InvalidRecord(_))
+            ));
+            assert_eq!(metadata.counters.read().unwrap()[DATABASE_ID_KEY], bytes);
+        }
+        metadata
+            .counters
+            .write()
+            .unwrap()
+            .insert(DATABASE_ID_KEY, (u32::MAX - 1).to_be_bytes().to_vec());
+        assert_eq!(metadata.allocate_database_id().await.unwrap(), u32::MAX);
+        assert_eq!(metadata.counters.read().unwrap()[DATABASE_ID_KEY], [255; 4]);
+        for _ in 0..2 {
+            assert!(matches!(
+                metadata.allocate_database_id().await,
+                Err(MetadataError::IdExhausted)
+            ));
+            assert_eq!(metadata.counters.read().unwrap()[DATABASE_ID_KEY], [255; 4]);
+        }
+        // An exhausted database domain does not exhaust the separate user domain.
+        assert_eq!(metadata.allocate_user_id().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn close_retains_counters_and_rejects_allocation() {
+        let metadata = MemoryMetadata::new();
+        assert_eq!(metadata.allocate_database_id().await.unwrap(), 1);
+        assert_eq!(metadata.allocate_user_id().await.unwrap(), 1);
+        let before = metadata.counters.read().unwrap().clone();
+        metadata.close().await.unwrap();
+        metadata.close().await.unwrap();
+        assert!(matches!(
+            metadata.allocate_database_id().await,
+            Err(MetadataError::Closed)
+        ));
+        assert!(matches!(
+            metadata.allocate_user_id().await,
+            Err(MetadataError::Closed)
+        ));
+        assert_eq!(*metadata.counters.read().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn poisoned_counter_storage_errors_and_can_be_closed() {
+        let metadata = MemoryMetadata::new();
+        assert!(
+            catch_unwind(|| {
+                let _guard = metadata.counters.write().unwrap();
+                panic!("injected counter writer failure");
+            })
+            .is_err()
+        );
+        assert!(matches!(
+            metadata.allocate_database_id().await,
+            Err(MetadataError::MemoryStatePoisoned)
+        ));
+        assert!(matches!(
+            metadata.allocate_user_id().await,
+            Err(MetadataError::MemoryStatePoisoned)
+        ));
+        metadata.close().await.unwrap();
+        assert!(matches!(
+            metadata.allocate_user_id().await,
             Err(MetadataError::Closed)
         ));
     }
