@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package io.lyra.meta.v1;
+
+// Durable initialization marker at `/catalog` (partition: `catalog`).
+// An unset flag is invalid metadata, distinct from explicit false.
+message Instance {
+  optional bool initialized = 1;
+}
+
+// Ephemeral presence at `/discovery/<component-type>/instances/<registration-uuid>`.
+// The UUID belongs only in the key, never in this value. The selected kind must
+// agree with the key's component type. An unset kind is invalid metadata.
+message Component {
+  oneof kind {
+    CatalogComponent catalog = 2;
+  }
+}
+
+// Catalog presence has no endpoint, statistics, or other payload fields yet.
+message CatalogComponent {}

@@ -6,3 +6,9 @@ rust-version = "1.92"
 license = "Apache-2.0"
 repository = "https://github.com/lyra-io/lyra-meta"
 description = "Shared metadata foundation for Lyra."
+
+[dependencies]
+prost = "0.13.5"
+
+[build-dependencies]
+prost-build = "0.13.5"
