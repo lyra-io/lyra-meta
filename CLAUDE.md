@@ -1,9 +1,9 @@
 # Lyra Meta Instructions
 
 `lyra-meta` is Lyra's shared metadata library. It currently exposes bootstrap and
-component registration Protobuf contracts and typed, Memory-backed initialization
-reads. Bootstrap writes, durable storage, and registration operations are introduced
-separately.
+component registration Protobuf contracts, bootstrap credential helpers, and typed,
+Memory-backed initialization reads. Bootstrap writes, durable storage, and
+registration operations are introduced separately.
 Do not add a README. `CLAUDE.md` is the instruction entry point, and `AGENTS.md`
 must remain a tracked relative symlink to it.
 
@@ -37,6 +37,20 @@ reviewed change; do not copy the shared policy here or silently change revisions
 - `src/proto/redacted.rs` supplies redacted `Debug` implementations for `User`
   and `ScramSha256Verifier`; keep their generated debug output disabled in
   `build.rs`. Redaction does not sanitize field access or serialized bytes.
+- `src/credentials` generates bootstrap SCRAM-SHA-256 verifiers and validates
+  their structure. `make_verifier` and `validate_verifier` are synchronous and
+  independent of storage. They do not implement login, password-file loading,
+  password-strength policy, or initialization writes. Async callers must move
+  derivation off executor workers. Errors must not carry credential contents.
+- Credential generation uses `ring` primitives/OS randomness, `stringprep` for
+  SASLprep, and `zeroize` for Lyra-owned normalized/salted password buffers.
+  Retain PostgreSQL-style fallback for prohibited or empty normalization results.
+  Do not claim all library temporaries, caller-owned input, or returned Protobuf
+  fields are erased. Keep the current 4096-iteration work factor explicit;
+  configurable work factors belong to a separately reviewed change.
+- Credential unit tests cover the public RFC vector, normalization, and injected
+  RNG failure. `tests/credentials.rs` covers the public API, byte/record bounds,
+  no-repair validation, serialization, and redaction using synthetic inputs only.
 - `src/metadata` owns the `Metadata` trait, typed errors, marker validation, and
   `MemoryMetadata`. Its current methods are `fetch_instance`, `is_initialized`,
   and `close`; add other methods only with their implementations and tests.
@@ -65,12 +79,13 @@ cargo package --locked
 git diff --check
 ```
 
-These checks cover wire contracts and the implemented Memory read/close behavior,
-not durable storage, bootstrap, or registration. Typed initialization reads reject
-an unset flag even though raw Protobuf decoding accepts it. Component validation
-will arrive with registration. Tokio is currently a test-only dependency; metadata
-construction must require no runtime or process-global setup. No Oxia, Docker,
-Kubernetes, credentials, or deployment is required for these checks.
+These checks cover wire contracts, credential helpers, and the implemented Memory
+read/close behavior, not authentication, durable storage, bootstrap writes, or
+registration. Typed initialization reads reject an unset flag even though raw
+Protobuf decoding accepts it. Component validation will arrive with registration.
+Tokio is currently a test-only dependency; metadata construction must require no
+runtime or process-global setup. No Oxia, Docker, Kubernetes, real credentials,
+or deployment is required for these checks.
 
 ## Implementation boundaries
 

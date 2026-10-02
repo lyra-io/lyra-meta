@@ -10,7 +10,10 @@ description = "Shared metadata foundation for Lyra."
 [dependencies]
 async-trait = "0.1"
 prost = "0.13.5"
+ring = "0.17.14"
+stringprep = "0.1.5"
 thiserror = "2"
+zeroize = "1.8"
 
 [build-dependencies]
 prost-build = "0.13.5"
