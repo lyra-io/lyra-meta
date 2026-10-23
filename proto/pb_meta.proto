@@ -46,5 +46,20 @@ message ScramSha256Verifier {
 }
 
 // /discovery/<component-type>/instances/<registration-uuid>
-// (partition: discovery/<component-type>). Ephemeral; an empty value is present.
-message ComponentRegistration {}
+// (partition: discovery/<component-type>). Ephemeral presence with a typed
+// discovery payload. The registration UUID lives only in the key.
+enum RegistrationState {
+  REGISTRATION_STATE_UNSPECIFIED = 0;
+  REGISTRATION_STATE_READY = 1;
+  REGISTRATION_STATE_DRAINING = 2;
+}
+
+message ComponentRegistration {
+  uint32 format_version = 1;
+  string instance_id = 2;
+  RegistrationState state = 3;
+  string pg_endpoint = 4;
+  optional uint32 connection_capacity = 5;
+  uint32 active_connections = 6;
+  uint32 in_flight_requests = 7;
+}

@@ -1,6 +1,7 @@
 use lyra_meta::metadata::{MemoryMetadata, Metadata};
 use lyra_meta::proto::pb_meta::{
-    Allocator, ComponentRegistration, Database, Instance, ScramSha256Verifier, User,
+    Allocator, ComponentRegistration, Database, Instance, RegistrationState, ScramSha256Verifier,
+    User,
 };
 use lyra_meta::utils::verifier::make_verifier;
 use opentelemetry::metrics::MeterProvider;
@@ -12,6 +13,16 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::instrument::WithSubscriber;
+
+fn ready() -> ComponentRegistration {
+    ComponentRegistration {
+        format_version: 1,
+        instance_id: "test-instance".into(),
+        state: RegistrationState::Ready as i32,
+        pg_endpoint: "127.0.0.1:5432".into(),
+        ..Default::default()
+    }
+}
 
 #[test]
 fn stable_wire_tags_and_redacted_credentials() {
@@ -30,7 +41,10 @@ fn stable_wire_tags_and_redacted_credentials() {
         .encode_to_vec(),
         [8, 1]
     );
-    assert!(ComponentRegistration {}.encode_to_vec().is_empty());
+    assert_eq!(
+        ComponentRegistration::default().state,
+        RegistrationState::Unspecified as i32
+    );
     assert_eq!(Allocator { last_allocated: 7 }.encode_to_vec(), [8, 7]);
     let database = Database {
         name: "db".into(),
@@ -120,7 +134,10 @@ async fn production_metrics_and_logs_are_bounded_and_redacted() {
                 .await
                 .is_err()
         );
-        let registration = metadata.register_component("catalog").await.unwrap();
+        let registration = metadata
+            .register_component("catalog", ready())
+            .await
+            .unwrap();
         assert!(registration.is_registered().await.unwrap());
         registration.unregister().await.unwrap();
     }

@@ -1,7 +1,8 @@
 //! Private transport primitives, shared by the existing Metadata implementations.
 //! Components use Metadata, never this key/value interface.
 use super::registration::Lease;
-use super::{ComponentIdentity, Result};
+use super::{ComponentIdentity, RegisteredComponent, Result};
+use crate::proto::pb_meta::ComponentRegistration;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -31,7 +32,11 @@ pub(crate) trait Storage: Send + Sync {
         index: Option<(&str, &str)>,
     ) -> Result<Row>;
     async fn delete(&self, key: &str, version: i64) -> Result<()>;
-    async fn register(&self, component: &str) -> Result<(ComponentIdentity, Arc<dyn Lease>)>;
-    async fn registrations(&self, component: &str) -> Result<Vec<ComponentIdentity>>;
+    async fn register(
+        &self,
+        component: &str,
+        registration: ComponentRegistration,
+    ) -> Result<(ComponentIdentity, Arc<dyn Lease>)>;
+    async fn registrations(&self, component: &str) -> Result<Vec<RegisteredComponent>>;
     async fn close(&self) -> Result<()>;
 }

@@ -3,8 +3,8 @@ use super::keys::Collection;
 use super::memory::MemoryStorage;
 use super::registration::Lease;
 use super::storage::{Condition, Row, Storage};
-use super::{ComponentIdentity, MetadataError, Result};
-use crate::proto::pb_meta::{Allocator, Database};
+use super::{ComponentIdentity, MetadataError, RegisteredComponent, Result};
+use crate::proto::pb_meta::{Allocator, ComponentRegistration, Database};
 use crate::utils::verifier::make_verifier;
 use async_trait::async_trait;
 use futures_util::future::join_all;
@@ -70,10 +70,14 @@ impl Storage for FaultStorage {
     async fn delete(&self, key: &str, version: i64) -> Result<()> {
         self.finish(self.base.delete(key, version).await).await
     }
-    async fn register(&self, component: &str) -> Result<(ComponentIdentity, Arc<dyn Lease>)> {
-        self.base.register(component).await
+    async fn register(
+        &self,
+        component: &str,
+        registration: ComponentRegistration,
+    ) -> Result<(ComponentIdentity, Arc<dyn Lease>)> {
+        self.base.register(component, registration).await
     }
-    async fn registrations(&self, component: &str) -> Result<Vec<ComponentIdentity>> {
+    async fn registrations(&self, component: &str) -> Result<Vec<RegisteredComponent>> {
         self.base.registrations(component).await
     }
     async fn close(&self) -> Result<()> {

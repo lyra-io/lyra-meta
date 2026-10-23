@@ -1,7 +1,9 @@
 use futures_util::future::join_all;
 use lyra_meta::metadata::oxia::{OxiaMetadata, OxiaOptions};
 use lyra_meta::metadata::{MemoryMetadata, Metadata, MetadataError};
-use lyra_meta::proto::pb_meta::{Database, DatabaseState, Instance};
+use lyra_meta::proto::pb_meta::{
+    ComponentRegistration, Database, DatabaseState, Instance, RegistrationState,
+};
 use lyra_meta::utils::verifier::make_verifier;
 use oxia::OxiaClient;
 use prost::Message;
@@ -9,6 +11,16 @@ use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
+
+fn ready(component: &str) -> ComponentRegistration {
+    ComponentRegistration {
+        format_version: 1,
+        instance_id: format!("test-{component}"),
+        state: RegistrationState::Ready as i32,
+        pg_endpoint: "127.0.0.1:5432".into(),
+        ..Default::default()
+    }
+}
 
 #[tokio::test]
 async fn memory_implements_the_metadata_contract() {
@@ -181,9 +193,18 @@ async fn contract(metadata: Arc<dyn Metadata>) {
         .unwrap();
     assert!(metadata.get_user("owner").await.unwrap().is_none());
 
-    let first = metadata.register_component("catalog").await.unwrap();
-    let second = metadata.register_component("catalog").await.unwrap();
-    let other = metadata.register_component("func").await.unwrap();
+    let first = metadata
+        .register_component("catalog", ready("catalog"))
+        .await
+        .unwrap();
+    let second = metadata
+        .register_component("catalog", ready("catalog"))
+        .await
+        .unwrap();
+    let other = metadata
+        .register_component("func", ready("func"))
+        .await
+        .unwrap();
     assert_ne!(first.identity(), second.identity());
     assert_eq!(metadata.list_components("catalog").await.unwrap().len(), 2);
     assert_eq!(metadata.list_components("func").await.unwrap().len(), 1);
@@ -202,7 +223,12 @@ async fn contract(metadata: Arc<dyn Metadata>) {
     second.unregister().await.unwrap();
     other.unregister().await.unwrap();
     for invalid in ["", "/catalog", "CATALOG", "a/b", "a_1", &"a".repeat(33)] {
-        assert!(metadata.register_component(invalid).await.is_err());
+        assert!(
+            metadata
+                .register_component(invalid, ComponentRegistration::default())
+                .await
+                .is_err()
+        );
     }
     let system = metadata.get_database("lyrasys").await.unwrap().unwrap();
     assert!(matches!(
@@ -423,7 +449,10 @@ async fn registration_expiry(metadata: &dyn Metadata) {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::process::Command;
-    let healthy = metadata.register_component("catalog").await.unwrap();
+    let healthy = metadata
+        .register_component("catalog", ready("catalog"))
+        .await
+        .unwrap();
     let mut child = Command::new(env::current_exe().unwrap())
         .args(["--ignored", "--exact", "registration_child", "--nocapture"])
         .env("LYRA_REGISTRATION_CHILD", "1")
@@ -448,7 +477,7 @@ async fn registration_expiry(metadata: &dyn Metadata) {
             .await
             .unwrap()
             .iter()
-            .any(|r| r.registration_id.to_string() == id)
+            .any(|r| r.identity.registration_id.to_string() == id)
     );
     child.kill().await.unwrap();
     child.wait().await.unwrap();
@@ -459,7 +488,7 @@ async fn registration_expiry(metadata: &dyn Metadata) {
                 .await
                 .unwrap()
                 .iter()
-                .any(|r| r.registration_id.to_string() == id)
+                .any(|r| r.identity.registration_id.to_string() == id)
             {
                 break;
             }
@@ -471,7 +500,10 @@ async fn registration_expiry(metadata: &dyn Metadata) {
     assert!(healthy.is_registered().await.unwrap());
     metadata.validate_initialized().await.unwrap();
     healthy.unregister().await.unwrap();
-    let fresh = metadata.register_component("catalog").await.unwrap();
+    let fresh = metadata
+        .register_component("catalog", ready("catalog"))
+        .await
+        .unwrap();
     assert_ne!(fresh.identity().registration_id.to_string(), id);
     healthy.unregister().await.unwrap();
     assert!(fresh.is_registered().await.unwrap());
@@ -486,7 +518,10 @@ async fn registration_child() {
     let options = OxiaOptions::new(env::var("OXIA_SERVICE_ADDRESS").unwrap(), "default")
         .with_session_timeout(Duration::from_secs(5));
     let metadata = OxiaMetadata::new(&options).await.unwrap();
-    let registration = metadata.register_component("catalog").await.unwrap();
+    let registration = metadata
+        .register_component("catalog", ready("catalog"))
+        .await
+        .unwrap();
     println!("REGISTERED {}", registration.identity().registration_id);
     stdout().flush().unwrap();
     std::future::pending::<()>().await;
