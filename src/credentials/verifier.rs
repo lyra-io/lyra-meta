@@ -58,9 +58,7 @@ fn make_verifier0(
     password: &str,
     fill_salt: impl FnOnce(&mut [u8]) -> StdResult<(), Unspecified>,
 ) -> Result<ScramSha256Verifier> {
-    if password.is_empty() || password.len() > MAX_PASSWORD_BYTES || password.contains('\0') {
-        return Err(CredentialError::InvalidPassword);
-    }
+    validate_password0(password)?;
     let mut salt = [0; SALT_LENGTH];
     fill_salt(&mut salt).map_err(|_| CredentialError::RandomUnavailable)?;
     // PostgreSQL treats an empty SASLprep result as prohibited, too. Never log
@@ -70,6 +68,13 @@ fn make_verifier0(
         _ => password.to_owned(),
     });
     Ok(derive0(normalized.as_bytes(), &salt))
+}
+
+fn validate_password0(password: &str) -> Result<()> {
+    if password.is_empty() || password.len() > MAX_PASSWORD_BYTES || password.contains('\0') {
+        return Err(CredentialError::InvalidPassword);
+    }
+    Ok(())
 }
 
 fn derive0(password: &[u8], salt: &[u8]) -> ScramSha256Verifier {
@@ -146,6 +151,13 @@ mod tests {
     }
 
     #[test]
+    fn public_wrapper_generates_a_valid_verifier_with_fresh_randomness() {
+        let verifier = make_verifier("unit-test-password").unwrap();
+        validate_verifier(&verifier).unwrap();
+        assert_eq!(verifier.salt.len(), SALT_LENGTH);
+    }
+
+    #[test]
     fn normalizes_without_trimming_or_case_folding() {
         for (input, normalized) in [
             ("I\u{00ad}X", "IX"),
@@ -191,9 +203,10 @@ mod tests {
             "a".repeat(MAX_PASSWORD_BYTES + 1),
             "é".repeat(513),
         ] {
-            let error = make_verifier0(&input, |_| panic!("invalid input requested randomness"))
-                .unwrap_err();
-            assert_eq!(error, CredentialError::InvalidPassword);
+            assert_eq!(
+                validate_password0(&input),
+                Err(CredentialError::InvalidPassword)
+            );
         }
     }
 
