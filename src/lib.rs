@@ -1,12 +1,9 @@
-//! Shared metadata foundation for Lyra.
+//! Shared Lyra metadata and protocol contracts.
 //!
-//! Bootstrap and component registration Protobuf contracts are available in
-//! [`proto::pb_meta`], with typed initialization reads and ID reservation in
-//! [`metadata`]. Bootstrap writes, durable storage, and registration operations
-//! are introduced separately.
-//! Bootstrap credential generation and validation live in [`credentials`]; this
-//! does not implement authentication or password-file loading.
+//! This crate provides authentication, protobuf types shared by Cata, Func, and
+//! Stream, together with the metadata interface and its Oxia-backed implementation.
 
-pub mod credentials;
+pub mod auth;
 pub mod metadata;
 pub mod proto;
+pub mod utils;

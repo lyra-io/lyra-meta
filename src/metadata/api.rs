@@ -1,62 +1,81 @@
-use super::{MetadataError, Result};
-use crate::proto::pb_meta::Instance;
+use super::{ComponentIdentity, Registration, Result};
+use crate::proto::pb_meta::{Database, Instance, ScramSha256Verifier};
 use async_trait::async_trait;
 
-/// Object-safe metadata operations, shareable as `Arc<dyn Metadata>`.
-///
-/// This slice defines initialization reads, ID reservation, and client closure.
-/// Bootstrap and registration methods arrive with their implementations.
-/// Reads never initialize, repair, or otherwise mutate stored records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataVersion(i64);
+
+impl MetadataVersion {
+    pub fn new(value: i64) -> Self {
+        Self(value)
+    }
+    pub fn value(self) -> i64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MetadataRecord<T> {
+    id: u32,
+    value: T,
+    version: MetadataVersion,
+}
+
+impl<T> MetadataRecord<T> {
+    pub fn new(id: u32, value: T, version: MetadataVersion) -> Self {
+        Self { id, value, version }
+    }
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+    pub fn value(&self) -> &T {
+        &self.value
+    }
+    pub fn version(&self) -> MetadataVersion {
+        self.version
+    }
+}
+
+/// Public user inventory never contains a credential.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserInfo {
+    pub name: String,
+}
+
+/// Name creation and per-type ID allocation are atomic between clients.
+/// Database lifecycle/session coordination and user deletion still require one
+/// lifecycle writer per namespace; this is not distributed writer fencing.
 #[async_trait]
 pub trait Metadata: Send + Sync {
-    /// Fetch and validate the initialization marker.
-    ///
-    /// `Ok(None)` means the record is absent. A malformed Protobuf value, an
-    /// absent `initialized` field, unavailable storage, or a closed client is an
-    /// error, never a missing record. Each call reads current state, not a cache.
-    async fn fetch_instance(&self) -> Result<Option<Instance>>;
+    async fn instance(&self) -> Result<Option<Instance>>;
+    async fn initialize(&self, verifier: ScramSha256Verifier) -> Result<()>;
+    async fn validate_initialized(&self) -> Result<()>;
 
-    /// Read whether the marker explicitly records completed initialization.
-    ///
-    /// An absent record or explicit false returns false. All errors propagate;
-    /// an absent field in an existing record is invalid, not false. True is a
-    /// marker observation, not validation of bootstrap objects or a writer lock.
-    async fn is_initialized(&self) -> Result<bool> {
-        match self.fetch_instance().await? {
-            None => Ok(false),
-            Some(instance) => instance.initialized.ok_or(MetadataError::InvalidRecord(
-                "initialization flag is absent",
-            )),
-        }
-    }
+    async fn get_user(&self, name: &str) -> Result<Option<MetadataRecord<UserInfo>>>;
+    async fn get_user_by_id(&self, id: u32) -> Result<Option<MetadataRecord<UserInfo>>>;
+    async fn list_users(&self) -> Result<Vec<MetadataRecord<UserInfo>>>;
+    /// Explicit authentication-only lookup. Never project this through SQL.
+    async fn user_verifier(&self, name: &str) -> Result<Option<ScramSha256Verifier>>;
+    async fn create_user(
+        &self,
+        name: &str,
+        verifier: ScramSha256Verifier,
+    ) -> Result<MetadataRecord<UserInfo>>;
+    async fn delete_user(&self, id: u32, version: MetadataVersion) -> Result<()>;
 
-    /// Reserve the next nonzero database ID without creating a database record.
-    ///
-    /// Database and user counters are independent. A missing counter starts at
-    /// one; reading, incrementing, and storing the counter is atomic with respect
-    /// to concurrent allocations within the backend's shared state.
-    /// An ID is returned only after this call's write is confirmed. Failed or
-    /// cancelled calls may consume IDs; IDs are not promised to be gapless and
-    /// must never be reclaimed or counters reset when records are deleted.
-    ///
-    /// Malformed counters are errors, never a reason to reset to zero. Exhaustion
-    /// returns [`MetadataError::IdExhausted`] without wrapping. Other errors
-    /// propagate without repairing or resetting the counter.
-    /// Memory guarantees uniqueness only within its shared client state; it is
-    /// not durable storage. No counter/key/version API is exposed to callers.
-    async fn allocate_database_id(&self) -> Result<u32>;
+    async fn get_database(&self, name: &str) -> Result<Option<MetadataRecord<Database>>>;
+    async fn get_database_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Database>>>;
+    async fn list_databases(&self) -> Result<Vec<MetadataRecord<Database>>>;
+    async fn create_database(&self, database: Database) -> Result<MetadataRecord<Database>>;
+    async fn update_database(
+        &self,
+        id: u32,
+        database: Database,
+        version: MetadataVersion,
+    ) -> Result<MetadataRecord<Database>>;
+    async fn delete_database(&self, id: u32, version: MetadataVersion) -> Result<()>;
 
-    /// Reserve the next nonzero user ID without creating a user record.
-    ///
-    /// Uses a separate counter with the same guarantees and failure semantics as
-    /// [`Self::allocate_database_id`]. Allocating IDs does not initialize metadata.
-    async fn allocate_user_id(&self) -> Result<u32>;
-
-    /// Idempotently close this client without deleting stored records or counters.
-    ///
-    /// Operations begun after successful closure return [`MetadataError::Closed`].
-    /// An operation admitted before a concurrent close may finish; a confirmed
-    /// allocation is never rolled back by closing the client.
-    /// Closing one independently constructed client does not close another.
+    async fn register_component(&self, component: &str) -> Result<Registration>;
+    async fn list_components(&self, component: &str) -> Result<Vec<ComponentIdentity>>;
     async fn close(&self) -> Result<()>;
 }
