@@ -4,12 +4,13 @@ use super::keys::{registration_key, validate_component};
 use super::registration::Lease;
 use super::storage::{Condition, Row, Storage};
 use super::{
-    ComponentIdentity, Metadata, MetadataError, MetadataRecord, MetadataVersion, Registration,
-    Result, UserInfo,
+    ComponentIdentity, Metadata, MetadataError, MetadataRecord, MetadataVersion,
+    RegisteredComponent, Registration, Result, UserInfo,
 };
-use crate::proto::pb_meta::{Database, Instance, ScramSha256Verifier};
+use crate::proto::pb_meta::{ComponentRegistration, Database, Instance, ScramSha256Verifier};
 use async_trait::async_trait;
 use opentelemetry::metrics::Meter;
+use prost::Message;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -133,11 +134,17 @@ impl Storage for MemoryStorage {
         state.indexes.remove(key);
         Ok(())
     }
-    async fn register(&self, component: &str) -> Result<(ComponentIdentity, Arc<dyn Lease>)> {
+    async fn register(
+        &self,
+        component: &str,
+        registration: ComponentRegistration,
+    ) -> Result<(ComponentIdentity, Arc<dyn Lease>)> {
         validate_component(component)?;
         let id = Uuid::new_v4();
         let key = registration_key(component, id)?;
-        let row = self.put(&key, Vec::new(), Condition::Missing, None).await?;
+        let row = self
+            .put(&key, registration.encode_to_vec(), Condition::Missing, None)
+            .await?;
         let identity = ComponentIdentity {
             component_type: component.into(),
             registration_id: id,
@@ -149,22 +156,26 @@ impl Storage for MemoryStorage {
         };
         Ok((identity, Arc::new(lease)))
     }
-    async fn registrations(&self, component: &str) -> Result<Vec<ComponentIdentity>> {
+    async fn registrations(&self, component: &str) -> Result<Vec<RegisteredComponent>> {
         validate_component(component)?;
         let prefix = format!("/discovery/{component}/instances/");
         let state = self.state.lock().await;
         check0(&state)?;
         state
             .rows
-            .keys()
-            .filter(|key| key.starts_with(&prefix))
-            .map(|key| {
+            .iter()
+            .filter(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, row)| {
                 let suffix = key.strip_prefix(&prefix).unwrap();
-                let id = Uuid::parse_str(suffix)
+                let registration_id = Uuid::parse_str(suffix)
                     .map_err(|_| MetadataError::InvalidRecord("invalid registration UUID"))?;
-                Ok(ComponentIdentity {
-                    component_type: component.into(),
-                    registration_id: id,
+                let registration = ComponentRegistration::decode(row.value.as_slice())?;
+                Ok(RegisteredComponent {
+                    identity: ComponentIdentity {
+                        component_type: component.into(),
+                        registration_id,
+                    },
+                    registration,
                 })
             })
             .collect()
@@ -192,6 +203,18 @@ impl Lease for MemoryLease {
             .get(&self.key)
             .await?
             .is_some_and(|row| row.version == self.version))
+    }
+    async fn publish(&self, registration: ComponentRegistration) -> Result<()> {
+        let mut state = self.storage.state.lock().await;
+        match state.rows.get_mut(&self.key) {
+            Some(row) if row.version == self.version => {
+                row.value = registration.encode_to_vec();
+                Ok(())
+            }
+            _ => Err(MetadataError::Conflict(
+                "registration no longer owned".into(),
+            )),
+        }
     }
     async fn close(&self) -> Result<()> {
         let mut state = self.storage.state.lock().await;

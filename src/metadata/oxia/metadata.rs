@@ -5,8 +5,8 @@ use crate::metadata::keys::{PARTITION, registration_key, validate_component};
 use crate::metadata::registration::Lease;
 use crate::metadata::storage::{Condition, Row, Storage};
 use crate::metadata::{
-    ComponentIdentity, Metadata, MetadataError, MetadataRecord, MetadataVersion, Registration,
-    Result, UserInfo,
+    ComponentIdentity, Metadata, MetadataError, MetadataRecord, MetadataVersion,
+    RegisteredComponent, Registration, Result, UserInfo,
 };
 use crate::proto::pb_meta::{ComponentRegistration, Database, Instance, ScramSha256Verifier};
 use async_trait::async_trait;
@@ -14,6 +14,7 @@ use opentelemetry::metrics::Meter;
 use oxia::{GetResult, OxiaClient, OxiaError};
 use prost::Message;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use uuid::Uuid;
 
 pub struct OxiaMetadata {
@@ -134,7 +135,11 @@ impl Storage for OxiaStorage {
             .await
             .map_err(error0)
     }
-    async fn register(&self, component: &str) -> Result<(ComponentIdentity, Arc<dyn Lease>)> {
+    async fn register(
+        &self,
+        component: &str,
+        registration: ComponentRegistration,
+    ) -> Result<(ComponentIdentity, Arc<dyn Lease>)> {
         validate_component(component)?;
         let id = Uuid::new_v4();
         let key = registration_key(component, id)?;
@@ -143,7 +148,7 @@ impl Storage for OxiaStorage {
         // durable client's sessions or another registration's session.
         let client = connect(&self.options).await?;
         let result = client
-            .put(&key, ComponentRegistration {}.encode_to_vec())
+            .put(&key, registration.encode_to_vec())
             .partition_key(&partition)
             .expected_record_not_exists()
             .ephemeral()
@@ -163,11 +168,11 @@ impl Storage for OxiaStorage {
             client,
             key,
             partition,
-            version: result.version.version_id,
+            version: AtomicI64::new(result.version.version_id),
         };
         Ok((identity, Arc::new(lease)))
     }
-    async fn registrations(&self, component: &str) -> Result<Vec<ComponentIdentity>> {
+    async fn registrations(&self, component: &str) -> Result<Vec<RegisteredComponent>> {
         validate_component(component)?;
         let prefix = format!("/discovery/{component}/instances/");
         let end = format!("{prefix}/");
@@ -182,7 +187,7 @@ impl Storage for OxiaStorage {
                 if !row.version.is_ephemeral() {
                     return Err(MetadataError::Integrity("durable registration record"));
                 }
-                ComponentRegistration::decode(row.value.unwrap_or_default())?;
+                let registration = ComponentRegistration::decode(row.value.unwrap_or_default())?;
                 let suffix = row
                     .key
                     .strip_prefix(&prefix)
@@ -196,9 +201,12 @@ impl Storage for OxiaStorage {
                         "non-canonical registration UUID",
                     ));
                 }
-                Ok(ComponentIdentity {
-                    component_type: component.into(),
-                    registration_id: id,
+                Ok(RegisteredComponent {
+                    identity: ComponentIdentity {
+                        component_type: component.into(),
+                        registration_id: id,
+                    },
+                    registration,
                 })
             })
             .collect()
@@ -213,7 +221,7 @@ struct OxiaLease {
     client: OxiaClient,
     key: String,
     partition: String,
-    version: i64,
+    version: AtomicI64,
 }
 
 #[async_trait]
@@ -225,10 +233,24 @@ impl Lease for OxiaLease {
             .partition_key(&self.partition)
             .await
         {
-            Ok(row) => Ok(row.version.is_ephemeral() && row.version.version_id == self.version),
+            Ok(row) => Ok(row.version.is_ephemeral()
+                && row.version.version_id == self.version.load(Ordering::SeqCst)),
             Err(OxiaError::KeyNotFound | OxiaError::Closed) => Ok(false),
             Err(error) => Err(error0(error)),
         }
+    }
+    async fn publish(&self, registration: ComponentRegistration) -> Result<()> {
+        let result = self
+            .client
+            .put(&self.key, registration.encode_to_vec())
+            .partition_key(&self.partition)
+            .expected_version_id(self.version.load(Ordering::SeqCst))
+            .ephemeral()
+            .await
+            .map_err(error0)?;
+        self.version
+            .store(result.version.version_id, Ordering::SeqCst);
+        Ok(())
     }
     async fn close(&self) -> Result<()> {
         // Close the owning session, never unconditionally delete a UUID key that

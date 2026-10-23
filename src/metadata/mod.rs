@@ -14,7 +14,7 @@ mod validation;
 pub use api::{Metadata, MetadataRecord, MetadataVersion, UserInfo};
 pub use error::{MetadataError, Result};
 pub use memory::MemoryMetadata;
-pub use registration::{ComponentIdentity, Registration};
+pub use registration::{ComponentIdentity, RegisteredComponent, Registration};
 pub use validation::{normalize_sql_identifier, validate_name};
 
 pub const DEFAULT_DATABASE_NAME: &str = "public";

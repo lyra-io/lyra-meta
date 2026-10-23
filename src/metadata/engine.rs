@@ -837,9 +837,13 @@ macro_rules! metadata_impl {
                     .observe("delete", self.engine.delete_database(id, version))
                     .await
             }
-            async fn register_component(&self, component: &str) -> Result<Registration> {
+            async fn register_component(
+                &self,
+                component: &str,
+                registration: ComponentRegistration,
+            ) -> Result<Registration> {
                 super_validate_component(component)?;
-                let result = self.engine.store.register(component).await;
+                let result = self.engine.store.register(component, registration).await;
                 self.engine
                     .metrics
                     .registration(component, "register", result.is_ok());
@@ -851,7 +855,7 @@ macro_rules! metadata_impl {
                     self.engine.metrics.clone(),
                 ))
             }
-            async fn list_components(&self, component: &str) -> Result<Vec<ComponentIdentity>> {
+            async fn list_components(&self, component: &str) -> Result<Vec<RegisteredComponent>> {
                 super_validate_component(component)?;
                 self.engine
                     .metrics

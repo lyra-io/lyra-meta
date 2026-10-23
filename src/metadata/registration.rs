@@ -1,5 +1,6 @@
 use super::Result;
 use super::telemetry::Metrics;
+use crate::proto::pb_meta::ComponentRegistration;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,9 +13,17 @@ pub struct ComponentIdentity {
     pub registration_id: Uuid,
 }
 
+/// A discovered component registration: the key identity plus its payload.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegisteredComponent {
+    pub identity: ComponentIdentity,
+    pub registration: ComponentRegistration,
+}
+
 #[async_trait]
 pub(crate) trait Lease: Send + Sync {
     async fn present(&self) -> Result<bool>;
+    async fn publish(&self, registration: ComponentRegistration) -> Result<()>;
     async fn close(&self) -> Result<()>;
 }
 
@@ -52,6 +61,16 @@ impl Registration {
         let result = self.lease.present().await;
         self.metrics
             .registered(&self.identity.component_type, matches!(result, Ok(true)));
+        result
+    }
+
+    pub async fn publish(&self, registration: ComponentRegistration) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let result = self.lease.publish(registration).await;
+        self.metrics
+            .registration(&self.identity.component_type, "publish", result.is_ok());
         result
     }
 

@@ -1,5 +1,5 @@
-use super::{ComponentIdentity, Registration, Result};
-use crate::proto::pb_meta::{Database, Instance, ScramSha256Verifier};
+use super::{RegisteredComponent, Registration, Result};
+use crate::proto::pb_meta::{ComponentRegistration, Database, Instance, ScramSha256Verifier};
 use async_trait::async_trait;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,7 +75,11 @@ pub trait Metadata: Send + Sync {
     ) -> Result<MetadataRecord<Database>>;
     async fn delete_database(&self, id: u32, version: MetadataVersion) -> Result<()>;
 
-    async fn register_component(&self, component: &str) -> Result<Registration>;
-    async fn list_components(&self, component: &str) -> Result<Vec<ComponentIdentity>>;
+    async fn register_component(
+        &self,
+        component: &str,
+        registration: ComponentRegistration,
+    ) -> Result<Registration>;
+    async fn list_components(&self, component: &str) -> Result<Vec<RegisteredComponent>>;
     async fn close(&self) -> Result<()>;
 }
