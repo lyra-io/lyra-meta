@@ -35,10 +35,11 @@ message User {
 // The definition is an opaque, user-supplied string; the format type tells the
 // client how to interpret it. Lyra never parses the definition.
 message Format {
-  string name = 1;
-  FormatType format_type = 2;
-  bytes definition = 3;
-  uint32 id = 4;
+  uint32 database_id = 1;
+  string name = 2;
+  FormatType format_type = 3;
+  bytes definition = 4;
+  uint32 id = 5;
 }
 
 enum FormatType {
@@ -51,11 +52,13 @@ enum FormatType {
 // A stream is a single ordered log of opaque bytes. `format_name` is optional;
 // when absent the stream is raw. Replication is absent means the default (2).
 message Stream {
-  string name = 1;
-  optional string format_name = 2;
-  optional uint32 replication = 3;
-  uint32 id = 4;
-  repeated StreamFragment fragments = 5;
+  uint32 database_id = 1;
+  string schema_name = 2;
+  string name = 3;
+  optional string format_name = 4;
+  optional uint32 replication = 5;
+  uint32 id = 6;
+  repeated StreamFragment fragments = 7;
 }
 
 // A logical, node-reported slice of a stream's ordered log. The node records a

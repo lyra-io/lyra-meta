@@ -1,4 +1,4 @@
-use super::keys::{CATALOG, Collection};
+use super::keys::{CATALOG, Collection, format_key, format_range, stream_key, stream_range};
 use super::storage::{Condition, Row, Storage};
 use super::telemetry::Metrics;
 use super::{
@@ -148,7 +148,7 @@ impl Engine {
         let user = self
             .allocate0(
                 Collection::Users,
-                &user.name,
+                &Collection::Users.key(&user.name)?,
                 user.encode_to_vec(),
                 &mut blocked,
             )
@@ -161,7 +161,7 @@ impl Engine {
             }
             self.allocate0(
                 Collection::Databases,
-                name,
+                &Collection::Databases.key(name)?,
                 database.encode_to_vec(),
                 &mut blocked,
             )
@@ -199,8 +199,16 @@ impl Engine {
             .find(|u| u.value().name == SYSTEM_USER_NAME)
             .ok_or(MetadataError::Integrity("system user missing"))?;
         let databases = self.list_databases().await?;
-        let formats = self.list_formats().await?;
-        let streams = self.list_streams().await?;
+        let (formats_first, formats_last) = Collection::Formats.range();
+        let mut max_format_id = 0u32;
+        for row in self.store.scan(&formats_first, &formats_last).await? {
+            max_format_id = max_format_id.max(decode_format(&row)?.id());
+        }
+        let (streams_first, streams_last) = Collection::Streams.range();
+        let mut max_stream_id = 0u32;
+        for row in self.store.scan(&streams_first, &streams_last).await? {
+            max_stream_id = max_stream_id.max(decode_stream(&row)?.id());
+        }
         for (kind, maximum) in [
             (
                 Collection::Users,
@@ -214,14 +222,8 @@ impl Engine {
                     .max()
                     .unwrap_or(0),
             ),
-            (
-                Collection::Formats,
-                formats.iter().map(|format| format.id()).max().unwrap_or(0),
-            ),
-            (
-                Collection::Streams,
-                streams.iter().map(|stream| stream.id()).max().unwrap_or(0),
-            ),
+            (Collection::Formats, max_format_id),
+            (Collection::Streams, max_stream_id),
         ] {
             let row = self
                 .store
@@ -330,7 +332,12 @@ impl Engine {
             password_verifier: Some(verifier),
         };
         let row = self
-            .allocate0(Collection::Users, name, user.encode_to_vec(), &mut blocked)
+            .allocate0(
+                Collection::Users,
+                &Collection::Users.key(name)?,
+                user.encode_to_vec(),
+                &mut blocked,
+            )
             .await?;
         Ok(public_user(decode_user(&row)?))
     }
@@ -444,7 +451,7 @@ impl Engine {
         let row = self
             .allocate0(
                 Collection::Databases,
-                &database.name,
+                &Collection::Databases.key(&database.name)?,
                 database.encode_to_vec(),
                 &mut blocked,
             )
@@ -546,8 +553,13 @@ impl Engine {
         .await
     }
 
-    pub(crate) async fn get_format(&self, name: &str) -> Result<Option<MetadataRecord<Format>>> {
-        self.unique0(Collection::Formats, name)
+    pub(crate) async fn get_format(
+        &self,
+        database_id: u32,
+        name: &str,
+    ) -> Result<Option<MetadataRecord<Format>>> {
+        self.store
+            .get(&format_key(database_id, name)?)
             .await?
             .as_ref()
             .map(decode_format)
@@ -566,8 +578,11 @@ impl Engine {
         Ok(record)
     }
 
-    pub(crate) async fn list_formats(&self) -> Result<Vec<MetadataRecord<Format>>> {
-        let (first, last) = Collection::Formats.range();
+    pub(crate) async fn list_formats(
+        &self,
+        database_id: u32,
+    ) -> Result<Vec<MetadataRecord<Format>>> {
+        let (first, last) = format_range(database_id);
         let mut ids = HashSet::new();
         let mut formats = Vec::new();
         for row in self.store.scan(&first, &last).await? {
@@ -594,7 +609,7 @@ impl Engine {
         }
         self.ready0().await?;
         if self
-            .unique0(Collection::Formats, &format.name)
+            .get_format(format.database_id, &format.name)
             .await?
             .is_some()
         {
@@ -603,7 +618,7 @@ impl Engine {
         let row = self
             .allocate0(
                 Collection::Formats,
-                &format.name,
+                &format_key(format.database_id, &format.name)?,
                 format.encode_to_vec(),
                 &mut blocked,
             )
@@ -622,16 +637,22 @@ impl Engine {
             .await?
             .ok_or(MetadataError::NotFound)?;
         self.delete0(
-            &Collection::Formats.key(&old.value().name)?,
+            &format_key(old.value().database_id, &old.value().name)?,
             version.value(),
             &mut blocked,
         )
         .await
     }
 
-    pub(crate) async fn get_stream(&self, name: &str) -> Result<Option<MetadataRecord<Stream>>> {
+    pub(crate) async fn get_stream(
+        &self,
+        database_id: u32,
+        schema_name: &str,
+        name: &str,
+    ) -> Result<Option<MetadataRecord<Stream>>> {
         let record = self
-            .unique0(Collection::Streams, name)
+            .store
+            .get(&stream_key(database_id, schema_name, name)?)
             .await?
             .as_ref()
             .map(decode_stream)
@@ -657,8 +678,11 @@ impl Engine {
         Ok(record)
     }
 
-    pub(crate) async fn list_streams(&self) -> Result<Vec<MetadataRecord<Stream>>> {
-        let (first, last) = Collection::Streams.range();
+    pub(crate) async fn list_streams(
+        &self,
+        database_id: u32,
+    ) -> Result<Vec<MetadataRecord<Stream>>> {
+        let (first, last) = stream_range(database_id);
         let mut ids = HashSet::new();
         let mut streams = Vec::new();
         for row in self.store.scan(&first, &last).await? {
@@ -687,7 +711,7 @@ impl Engine {
         self.ready0().await?;
         self.stream_format0(&stream).await?;
         if self
-            .unique0(Collection::Streams, &stream.name)
+            .get_stream(stream.database_id, &stream.schema_name, &stream.name)
             .await?
             .is_some()
         {
@@ -696,7 +720,7 @@ impl Engine {
         let row = self
             .allocate0(
                 Collection::Streams,
-                &stream.name,
+                &stream_key(stream.database_id, &stream.schema_name, &stream.name)?,
                 stream.encode_to_vec(),
                 &mut blocked,
             )
@@ -723,15 +747,17 @@ impl Engine {
         if old.version() != version {
             return Err(MetadataError::Conflict("stream version".into()));
         }
-        if stream.id != id || stream.name != old.value().name {
-            return Err(MetadataError::InvalidRecord(
-                "stream ID and name are immutable",
-            ));
+        if stream.id != id
+            || stream.database_id != old.value().database_id
+            || stream.schema_name != old.value().schema_name
+            || stream.name != old.value().name
+        {
+            return Err(MetadataError::InvalidRecord("stream identity is immutable"));
         }
         self.stream_format0(&stream).await?;
         let row = self
             .put0(
-                &Collection::Streams.key(&stream.name)?,
+                &stream_key(stream.database_id, &stream.schema_name, &stream.name)?,
                 stream.encode_to_vec(),
                 version.value(),
                 None,
@@ -752,7 +778,11 @@ impl Engine {
             .await?
             .ok_or(MetadataError::NotFound)?;
         self.delete0(
-            &Collection::Streams.key(&old.value().name)?,
+            &stream_key(
+                old.value().database_id,
+                &old.value().schema_name,
+                &old.value().name,
+            )?,
             version.value(),
             &mut blocked,
         )
@@ -761,7 +791,10 @@ impl Engine {
 
     async fn stream_format0(&self, stream: &Stream) -> Result<()> {
         if let Some(format_name) = &stream.format_name
-            && self.get_format(format_name).await?.is_none()
+            && self
+                .get_format(stream.database_id, format_name)
+                .await?
+                .is_none()
         {
             return Err(MetadataError::Integrity("stream format does not exist"));
         }
@@ -771,7 +804,7 @@ impl Engine {
     async fn allocate0(
         &self,
         kind: Collection,
-        name: &str,
+        key: &str,
         value: Vec<u8>,
         blocked: &mut bool,
     ) -> Result<Row> {
@@ -798,11 +831,10 @@ impl Engine {
                 stream.encode_to_vec()
             }
         };
-        let key = kind.key(name)?;
         *blocked = true;
         match self
             .store
-            .put(&key, value.clone(), Condition::Missing, None)
+            .put(key, value.clone(), Condition::Missing, None)
             .await
         {
             Ok(row) => {
@@ -813,7 +845,7 @@ impl Engine {
                 *blocked = false;
                 Err(MetadataError::AlreadyExists)
             }
-            Err(_) => match self.store.get(&key).await {
+            Err(_) => match self.store.get(key).await {
                 Ok(Some(row)) if row.value == value => {
                     self.metrics.reconciled("create");
                     *blocked = false;
@@ -957,6 +989,9 @@ fn decode_database(row: &Row) -> Result<MetadataRecord<Database>> {
 }
 
 fn validate_format(format: &Format) -> Result<()> {
+    if format.database_id == 0 {
+        return Err(MetadataError::InvalidRecord("zero format database"));
+    }
     validate_name(&format.name)?;
     FormatType::try_from(format.format_type)
         .map_err(|_| MetadataError::InvalidRecord("unknown format type"))?;
@@ -970,7 +1005,7 @@ fn decode_format(row: &Row) -> Result<MetadataRecord<Format>> {
     let format = Format::decode(row.value.as_slice())?;
     validate_format(&format)?;
     let id = format.id;
-    if id == 0 || row.key != Collection::Formats.key(&format.name)? {
+    if id == 0 || row.key != format_key(format.database_id, &format.name)? {
         return Err(MetadataError::Integrity("format key or ID mismatch"));
     }
     Ok(MetadataRecord::new(
@@ -981,6 +1016,10 @@ fn decode_format(row: &Row) -> Result<MetadataRecord<Format>> {
 }
 
 fn validate_stream(stream: &Stream) -> Result<()> {
+    if stream.database_id == 0 {
+        return Err(MetadataError::InvalidRecord("zero stream database"));
+    }
+    validate_name(&stream.schema_name)?;
     validate_name(&stream.name)?;
     if let Some(format_name) = &stream.format_name {
         validate_name(format_name)?;
@@ -1016,7 +1055,7 @@ fn decode_stream(row: &Row) -> Result<MetadataRecord<Stream>> {
     let stream = Stream::decode(row.value.as_slice())?;
     validate_stream(&stream)?;
     let id = stream.id;
-    if id == 0 || row.key != Collection::Streams.key(&stream.name)? {
+    if id == 0 || row.key != stream_key(stream.database_id, &stream.schema_name, &stream.name)? {
         return Err(MetadataError::Integrity("stream key or ID mismatch"));
     }
     Ok(MetadataRecord::new(
@@ -1163,10 +1202,17 @@ macro_rules! metadata_impl {
                     .observe("delete", self.engine.delete_database(id, version))
                     .await
             }
-            async fn get_format(&self, name: &str) -> Result<Option<MetadataRecord<Format>>> {
+            async fn get_format(
+                &self,
+                database_id: u32,
+                name: &str,
+            ) -> Result<Option<MetadataRecord<Format>>> {
                 self.engine
                     .metrics
-                    .observe("get", self.engine.read(self.engine.get_format(name)))
+                    .observe(
+                        "get",
+                        self.engine.read(self.engine.get_format(database_id, name)),
+                    )
                     .await
             }
             async fn get_format_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Format>>> {
@@ -1175,10 +1221,13 @@ macro_rules! metadata_impl {
                     .observe("get", self.engine.read(self.engine.get_format_by_id(id)))
                     .await
             }
-            async fn list_formats(&self) -> Result<Vec<MetadataRecord<Format>>> {
+            async fn list_formats(&self, database_id: u32) -> Result<Vec<MetadataRecord<Format>>> {
                 self.engine
                     .metrics
-                    .observe("list", self.engine.read(self.engine.list_formats()))
+                    .observe(
+                        "list",
+                        self.engine.read(self.engine.list_formats(database_id)),
+                    )
                     .await
             }
             async fn create_format(&self, format: Format) -> Result<MetadataRecord<Format>> {
@@ -1193,10 +1242,19 @@ macro_rules! metadata_impl {
                     .observe("delete", self.engine.delete_format(id, version))
                     .await
             }
-            async fn get_stream(&self, name: &str) -> Result<Option<MetadataRecord<Stream>>> {
+            async fn get_stream(
+                &self,
+                database_id: u32,
+                schema_name: &str,
+                name: &str,
+            ) -> Result<Option<MetadataRecord<Stream>>> {
                 self.engine
                     .metrics
-                    .observe("get", self.engine.read(self.engine.get_stream(name)))
+                    .observe(
+                        "get",
+                        self.engine
+                            .read(self.engine.get_stream(database_id, schema_name, name)),
+                    )
                     .await
             }
             async fn get_stream_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Stream>>> {
@@ -1205,10 +1263,13 @@ macro_rules! metadata_impl {
                     .observe("get", self.engine.read(self.engine.get_stream_by_id(id)))
                     .await
             }
-            async fn list_streams(&self) -> Result<Vec<MetadataRecord<Stream>>> {
+            async fn list_streams(&self, database_id: u32) -> Result<Vec<MetadataRecord<Stream>>> {
                 self.engine
                     .metrics
-                    .observe("list", self.engine.read(self.engine.list_streams()))
+                    .observe(
+                        "list",
+                        self.engine.read(self.engine.list_streams(database_id)),
+                    )
                     .await
             }
             async fn create_stream(&self, stream: Stream) -> Result<MetadataRecord<Stream>> {

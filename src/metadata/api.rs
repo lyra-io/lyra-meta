@@ -77,15 +77,24 @@ pub trait Metadata: Send + Sync {
     ) -> Result<MetadataRecord<Database>>;
     async fn delete_database(&self, id: u32, version: MetadataVersion) -> Result<()>;
 
-    async fn get_format(&self, name: &str) -> Result<Option<MetadataRecord<Format>>>;
+    async fn get_format(
+        &self,
+        database_id: u32,
+        name: &str,
+    ) -> Result<Option<MetadataRecord<Format>>>;
     async fn get_format_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Format>>>;
-    async fn list_formats(&self) -> Result<Vec<MetadataRecord<Format>>>;
+    async fn list_formats(&self, database_id: u32) -> Result<Vec<MetadataRecord<Format>>>;
     async fn create_format(&self, format: Format) -> Result<MetadataRecord<Format>>;
     async fn delete_format(&self, id: u32, version: MetadataVersion) -> Result<()>;
 
-    async fn get_stream(&self, name: &str) -> Result<Option<MetadataRecord<Stream>>>;
+    async fn get_stream(
+        &self,
+        database_id: u32,
+        schema_name: &str,
+        name: &str,
+    ) -> Result<Option<MetadataRecord<Stream>>>;
     async fn get_stream_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Stream>>>;
-    async fn list_streams(&self) -> Result<Vec<MetadataRecord<Stream>>>;
+    async fn list_streams(&self, database_id: u32) -> Result<Vec<MetadataRecord<Stream>>>;
     async fn create_stream(&self, stream: Stream) -> Result<MetadataRecord<Stream>>;
     async fn update_stream(
         &self,
