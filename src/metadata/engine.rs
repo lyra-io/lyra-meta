@@ -581,10 +581,7 @@ impl Engine {
         Ok(formats)
     }
 
-    pub(crate) async fn create_format(
-        &self,
-        format: Format,
-    ) -> Result<MetadataRecord<Format>> {
+    pub(crate) async fn create_format(&self, format: Format) -> Result<MetadataRecord<Format>> {
         validate_format(&format)?;
         if format.id != 0 {
             return Err(MetadataError::InvalidRecord(
@@ -596,7 +593,11 @@ impl Engine {
             return Err(MetadataError::UncertainWrite);
         }
         self.ready0().await?;
-        if self.unique0(Collection::Formats, &format.name).await?.is_some() {
+        if self
+            .unique0(Collection::Formats, &format.name)
+            .await?
+            .is_some()
+        {
             return Err(MetadataError::AlreadyExists);
         }
         let row = self
@@ -641,10 +642,7 @@ impl Engine {
         Ok(record)
     }
 
-    pub(crate) async fn get_stream_by_id(
-        &self,
-        id: u32,
-    ) -> Result<Option<MetadataRecord<Stream>>> {
+    pub(crate) async fn get_stream_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Stream>>> {
         let (first, last) = Collection::Streams.range();
         let mut record = None;
         for row in self.store.scan(&first, &last).await? {
@@ -675,10 +673,7 @@ impl Engine {
         Ok(streams)
     }
 
-    pub(crate) async fn create_stream(
-        &self,
-        stream: Stream,
-    ) -> Result<MetadataRecord<Stream>> {
+    pub(crate) async fn create_stream(&self, stream: Stream) -> Result<MetadataRecord<Stream>> {
         validate_stream(&stream)?;
         if stream.id != 0 {
             return Err(MetadataError::InvalidRecord(
@@ -691,7 +686,11 @@ impl Engine {
         }
         self.ready0().await?;
         self.stream_format0(&stream).await?;
-        if self.unique0(Collection::Streams, &stream.name).await?.is_some() {
+        if self
+            .unique0(Collection::Streams, &stream.name)
+            .await?
+            .is_some()
+        {
             return Err(MetadataError::AlreadyExists);
         }
         let row = self
@@ -962,9 +961,7 @@ fn validate_format(format: &Format) -> Result<()> {
     FormatType::try_from(format.format_type)
         .map_err(|_| MetadataError::InvalidRecord("unknown format type"))?;
     if format.definition.is_empty() {
-        return Err(MetadataError::InvalidRecord(
-            "format definition is empty",
-        ));
+        return Err(MetadataError::InvalidRecord("format definition is empty"));
     }
     Ok(())
 }
@@ -1007,12 +1004,7 @@ fn validate_stream(stream: &Stream) -> Result<()> {
 }
 
 fn validate_fragment(fragment: &StreamFragment) -> Result<()> {
-    if fragment.owners.is_empty()
-        || fragment
-            .owners
-            .iter()
-            .any(|owner| owner.is_empty())
-    {
+    if fragment.owners.is_empty() || fragment.owners.iter().any(|owner| owner.is_empty()) {
         return Err(MetadataError::InvalidRecord(
             "fragment must have at least one non-empty owner",
         ));

@@ -1,4 +1,4 @@
-use crate::metadata::{Metadata, MemoryMetadata};
+use crate::metadata::{MemoryMetadata, Metadata};
 use crate::proto::pb_meta::{Format, FormatType, Stream, StreamFragment};
 use crate::utils::verifier::make_verifier;
 
@@ -33,7 +33,10 @@ async fn creates_formats_and_streams_and_switches_fragment_owners() {
         .update_stream(created.id(), updated, created.version())
         .await
         .unwrap();
-    assert_eq!(updated.value().fragments[0].owners, vec!["node-2".to_string()]);
+    assert_eq!(
+        updated.value().fragments[0].owners,
+        vec!["node-2".to_string()]
+    );
 
     assert_eq!(meta.list_formats().await.unwrap().len(), 1);
     assert_eq!(meta.list_streams().await.unwrap().len(), 1);
