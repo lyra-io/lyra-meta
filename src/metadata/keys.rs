@@ -9,6 +9,8 @@ pub(crate) const PARTITION: &str = "catalog";
 pub(crate) enum Collection {
     Users,
     Databases,
+    Formats,
+    Streams,
 }
 
 impl Collection {
@@ -16,6 +18,8 @@ impl Collection {
         match self {
             Self::Users => "/catalog/users/",
             Self::Databases => "/catalog/databases/",
+            Self::Formats => "/catalog/formats/",
+            Self::Streams => "/catalog/streams/",
         }
     }
 
@@ -23,6 +27,8 @@ impl Collection {
         match self {
             Self::Users => "/catalog/allocator/user",
             Self::Databases => "/catalog/allocator/database",
+            Self::Formats => "/catalog/allocator/format",
+            Self::Streams => "/catalog/allocator/stream",
         }
     }
 
@@ -31,6 +37,14 @@ impl Collection {
     }
 
     pub(crate) fn key(self, name: &str) -> Result<String> {
+        match self {
+            Self::Users | Self::Databases => {}
+            Self::Formats | Self::Streams => {
+                return Err(MetadataError::InvalidRecord(
+                    "formats and streams use composite keys",
+                ));
+            }
+        }
         validate_name(name)?;
         // Bijection over canonical UTF-8 bytes, without path/escaping aliases.
         let mut key = String::with_capacity(self.prefix().len() + name.len() * 2);
@@ -40,6 +54,47 @@ impl Collection {
         }
         Ok(key)
     }
+}
+
+/// `/catalog/formats/<database-id>/<hex-encoded canonical name>`.
+pub(crate) fn format_key(database_id: u32, name: &str) -> Result<String> {
+    validate_name(name)?;
+    let mut key = String::with_capacity(Collection::Formats.prefix().len() + name.len() * 2 + 16);
+    write!(&mut key, "{}{database_id}/", Collection::Formats.prefix()).unwrap();
+    for byte in name.bytes() {
+        write!(&mut key, "{byte:02x}").unwrap();
+    }
+    Ok(key)
+}
+
+/// `/catalog/streams/<database-id>/<hex schema>/<hex name>`.
+pub(crate) fn stream_key(database_id: u32, schema: &str, name: &str) -> Result<String> {
+    validate_name(schema)?;
+    validate_name(name)?;
+    let mut key = String::with_capacity(
+        Collection::Streams.prefix().len() + (schema.len() + name.len()) * 2 + 24,
+    );
+    write!(&mut key, "{}{database_id}/", Collection::Streams.prefix()).unwrap();
+    for byte in schema.bytes() {
+        write!(&mut key, "{byte:02x}").unwrap();
+    }
+    key.push('/');
+    for byte in name.bytes() {
+        write!(&mut key, "{byte:02x}").unwrap();
+    }
+    Ok(key)
+}
+
+/// Range covering every format in one database.
+pub(crate) fn format_range(database_id: u32) -> (String, String) {
+    let first = format!("{}{database_id}/", Collection::Formats.prefix());
+    (first.clone(), format!("{first}~"))
+}
+
+/// Range covering every stream in one database, across all schemas.
+pub(crate) fn stream_range(database_id: u32) -> (String, String) {
+    let first = format!("{}{database_id}/", Collection::Streams.prefix());
+    (first.clone(), format!("{first}~"))
 }
 
 pub(crate) fn validate_component(component: &str) -> Result<()> {

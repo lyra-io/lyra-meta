@@ -1,4 +1,4 @@
-use super::keys::{CATALOG, Collection};
+use super::keys::{CATALOG, Collection, format_key, format_range, stream_key, stream_range};
 use super::storage::{Condition, Row, Storage};
 use super::telemetry::Metrics;
 use super::{
@@ -6,7 +6,8 @@ use super::{
     SYSTEM_DATABASE_NAME, SYSTEM_USER_NAME, UserInfo, validate_name,
 };
 use crate::proto::pb_meta::{
-    Allocator, Database, DatabaseState, Instance, ScramSha256Verifier, User,
+    Allocator, Database, DatabaseState, Format, FormatType, Instance, ScramSha256Verifier, Stream,
+    StreamFragment, User,
 };
 use crate::utils::verifier::validate_verifier;
 use opentelemetry::metrics::Meter;
@@ -89,7 +90,12 @@ impl Engine {
             Some(_) => return Err(MetadataError::IncompleteInitialization),
             None => {}
         }
-        for kind in [Collection::Users, Collection::Databases] {
+        for kind in [
+            Collection::Users,
+            Collection::Databases,
+            Collection::Formats,
+            Collection::Streams,
+        ] {
             let (first, last) = kind.range();
             if !self.store.scan(&first, &last).await?.is_empty() {
                 return Err(MetadataError::Integrity(
@@ -117,7 +123,12 @@ impl Engine {
             Err(_) => return Err(MetadataError::IncompleteInitialization),
         };
         *blocked = false;
-        for kind in [Collection::Users, Collection::Databases] {
+        for kind in [
+            Collection::Users,
+            Collection::Databases,
+            Collection::Formats,
+            Collection::Streams,
+        ] {
             *blocked = true;
             self.store
                 .put(
@@ -137,7 +148,7 @@ impl Engine {
         let user = self
             .allocate0(
                 Collection::Users,
-                &user.name,
+                &Collection::Users.key(&user.name)?,
                 user.encode_to_vec(),
                 &mut blocked,
             )
@@ -150,7 +161,7 @@ impl Engine {
             }
             self.allocate0(
                 Collection::Databases,
-                name,
+                &Collection::Databases.key(name)?,
                 database.encode_to_vec(),
                 &mut blocked,
             )
@@ -188,6 +199,16 @@ impl Engine {
             .find(|u| u.value().name == SYSTEM_USER_NAME)
             .ok_or(MetadataError::Integrity("system user missing"))?;
         let databases = self.list_databases().await?;
+        let (formats_first, formats_last) = Collection::Formats.range();
+        let mut max_format_id = 0u32;
+        for row in self.store.scan(&formats_first, &formats_last).await? {
+            max_format_id = max_format_id.max(decode_format(&row)?.id());
+        }
+        let (streams_first, streams_last) = Collection::Streams.range();
+        let mut max_stream_id = 0u32;
+        for row in self.store.scan(&streams_first, &streams_last).await? {
+            max_stream_id = max_stream_id.max(decode_stream(&row)?.id());
+        }
         for (kind, maximum) in [
             (
                 Collection::Users,
@@ -201,6 +222,8 @@ impl Engine {
                     .max()
                     .unwrap_or(0),
             ),
+            (Collection::Formats, max_format_id),
+            (Collection::Streams, max_stream_id),
         ] {
             let row = self
                 .store
@@ -227,6 +250,8 @@ impl Engine {
             let actual = match kind {
                 Collection::Users => decode_user(&row)?.value().name.clone(),
                 Collection::Databases => decode_database(&row)?.value().name.clone(),
+                Collection::Formats => decode_format(&row)?.value().name.clone(),
+                Collection::Streams => decode_stream(&row)?.value().name.clone(),
             };
             if actual != name {
                 return Err(MetadataError::Integrity("name key disagrees with record"));
@@ -307,7 +332,12 @@ impl Engine {
             password_verifier: Some(verifier),
         };
         let row = self
-            .allocate0(Collection::Users, name, user.encode_to_vec(), &mut blocked)
+            .allocate0(
+                Collection::Users,
+                &Collection::Users.key(name)?,
+                user.encode_to_vec(),
+                &mut blocked,
+            )
             .await?;
         Ok(public_user(decode_user(&row)?))
     }
@@ -421,7 +451,7 @@ impl Engine {
         let row = self
             .allocate0(
                 Collection::Databases,
-                &database.name,
+                &Collection::Databases.key(&database.name)?,
                 database.encode_to_vec(),
                 &mut blocked,
             )
@@ -523,10 +553,258 @@ impl Engine {
         .await
     }
 
+    pub(crate) async fn get_format(
+        &self,
+        database_id: u32,
+        name: &str,
+    ) -> Result<Option<MetadataRecord<Format>>> {
+        self.store
+            .get(&format_key(database_id, name)?)
+            .await?
+            .as_ref()
+            .map(decode_format)
+            .transpose()
+    }
+
+    pub(crate) async fn get_format_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Format>>> {
+        let (first, last) = Collection::Formats.range();
+        let mut record = None;
+        for row in self.store.scan(&first, &last).await? {
+            let format = decode_format(&row)?;
+            if format.id() == id && record.replace(format).is_some() {
+                return Err(MetadataError::Integrity("duplicate format ID"));
+            }
+        }
+        Ok(record)
+    }
+
+    pub(crate) async fn list_formats(
+        &self,
+        database_id: u32,
+    ) -> Result<Vec<MetadataRecord<Format>>> {
+        let (first, last) = format_range(database_id);
+        let mut ids = HashSet::new();
+        let mut formats = Vec::new();
+        for row in self.store.scan(&first, &last).await? {
+            let format = decode_format(&row)?;
+            if !ids.insert(format.id()) {
+                return Err(MetadataError::Integrity("duplicate format IDs"));
+            }
+            formats.push(format);
+        }
+        formats.sort_by_key(|format| format.id());
+        Ok(formats)
+    }
+
+    pub(crate) async fn create_format(&self, format: Format) -> Result<MetadataRecord<Format>> {
+        validate_format(&format)?;
+        if format.id != 0 {
+            return Err(MetadataError::InvalidRecord(
+                "new format ID must be allocated by Meta",
+            ));
+        }
+        let mut blocked = self.mutations.lock().await;
+        if *blocked {
+            return Err(MetadataError::UncertainWrite);
+        }
+        self.ready0().await?;
+        if self
+            .get_format(format.database_id, &format.name)
+            .await?
+            .is_some()
+        {
+            return Err(MetadataError::AlreadyExists);
+        }
+        let row = self
+            .allocate0(
+                Collection::Formats,
+                &format_key(format.database_id, &format.name)?,
+                format.encode_to_vec(),
+                &mut blocked,
+            )
+            .await?;
+        decode_format(&row)
+    }
+
+    pub(crate) async fn delete_format(&self, id: u32, version: MetadataVersion) -> Result<()> {
+        let mut blocked = self.mutations.lock().await;
+        if *blocked {
+            return Err(MetadataError::UncertainWrite);
+        }
+        self.ready0().await?;
+        let old = self
+            .get_format_by_id(id)
+            .await?
+            .ok_or(MetadataError::NotFound)?;
+        self.delete0(
+            &format_key(old.value().database_id, &old.value().name)?,
+            version.value(),
+            &mut blocked,
+        )
+        .await
+    }
+
+    pub(crate) async fn get_stream(
+        &self,
+        database_id: u32,
+        schema_name: &str,
+        name: &str,
+    ) -> Result<Option<MetadataRecord<Stream>>> {
+        let record = self
+            .store
+            .get(&stream_key(database_id, schema_name, name)?)
+            .await?
+            .as_ref()
+            .map(decode_stream)
+            .transpose()?;
+        if let Some(record) = &record {
+            self.stream_format0(record.value()).await?;
+        }
+        Ok(record)
+    }
+
+    pub(crate) async fn get_stream_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Stream>>> {
+        let (first, last) = Collection::Streams.range();
+        let mut record = None;
+        for row in self.store.scan(&first, &last).await? {
+            let stream = decode_stream(&row)?;
+            if stream.id() == id && record.replace(stream).is_some() {
+                return Err(MetadataError::Integrity("duplicate stream ID"));
+            }
+        }
+        if let Some(record) = &record {
+            self.stream_format0(record.value()).await?;
+        }
+        Ok(record)
+    }
+
+    pub(crate) async fn list_streams(
+        &self,
+        database_id: u32,
+    ) -> Result<Vec<MetadataRecord<Stream>>> {
+        let (first, last) = stream_range(database_id);
+        let mut ids = HashSet::new();
+        let mut streams = Vec::new();
+        for row in self.store.scan(&first, &last).await? {
+            let stream = decode_stream(&row)?;
+            self.stream_format0(stream.value()).await?;
+            if !ids.insert(stream.id()) {
+                return Err(MetadataError::Integrity("duplicate stream IDs"));
+            }
+            streams.push(stream);
+        }
+        streams.sort_by_key(|stream| stream.id());
+        Ok(streams)
+    }
+
+    pub(crate) async fn create_stream(&self, stream: Stream) -> Result<MetadataRecord<Stream>> {
+        validate_stream(&stream)?;
+        if stream.id != 0 {
+            return Err(MetadataError::InvalidRecord(
+                "new stream ID must be allocated by Meta",
+            ));
+        }
+        let mut blocked = self.mutations.lock().await;
+        if *blocked {
+            return Err(MetadataError::UncertainWrite);
+        }
+        self.ready0().await?;
+        self.stream_format0(&stream).await?;
+        if self
+            .get_stream(stream.database_id, &stream.schema_name, &stream.name)
+            .await?
+            .is_some()
+        {
+            return Err(MetadataError::AlreadyExists);
+        }
+        let row = self
+            .allocate0(
+                Collection::Streams,
+                &stream_key(stream.database_id, &stream.schema_name, &stream.name)?,
+                stream.encode_to_vec(),
+                &mut blocked,
+            )
+            .await?;
+        decode_stream(&row)
+    }
+
+    pub(crate) async fn update_stream(
+        &self,
+        id: u32,
+        stream: Stream,
+        version: MetadataVersion,
+    ) -> Result<MetadataRecord<Stream>> {
+        validate_stream(&stream)?;
+        let mut blocked = self.mutations.lock().await;
+        if *blocked {
+            return Err(MetadataError::UncertainWrite);
+        }
+        self.ready0().await?;
+        let old = self
+            .get_stream_by_id(id)
+            .await?
+            .ok_or(MetadataError::NotFound)?;
+        if old.version() != version {
+            return Err(MetadataError::Conflict("stream version".into()));
+        }
+        if stream.id != id
+            || stream.database_id != old.value().database_id
+            || stream.schema_name != old.value().schema_name
+            || stream.name != old.value().name
+        {
+            return Err(MetadataError::InvalidRecord("stream identity is immutable"));
+        }
+        self.stream_format0(&stream).await?;
+        let row = self
+            .put0(
+                &stream_key(stream.database_id, &stream.schema_name, &stream.name)?,
+                stream.encode_to_vec(),
+                version.value(),
+                None,
+                &mut blocked,
+            )
+            .await?;
+        decode_stream(&row)
+    }
+
+    pub(crate) async fn delete_stream(&self, id: u32, version: MetadataVersion) -> Result<()> {
+        let mut blocked = self.mutations.lock().await;
+        if *blocked {
+            return Err(MetadataError::UncertainWrite);
+        }
+        self.ready0().await?;
+        let old = self
+            .get_stream_by_id(id)
+            .await?
+            .ok_or(MetadataError::NotFound)?;
+        self.delete0(
+            &stream_key(
+                old.value().database_id,
+                &old.value().schema_name,
+                &old.value().name,
+            )?,
+            version.value(),
+            &mut blocked,
+        )
+        .await
+    }
+
+    async fn stream_format0(&self, stream: &Stream) -> Result<()> {
+        if let Some(format_name) = &stream.format_name
+            && self
+                .get_format(stream.database_id, format_name)
+                .await?
+                .is_none()
+        {
+            return Err(MetadataError::Integrity("stream format does not exist"));
+        }
+        Ok(())
+    }
+
     async fn allocate0(
         &self,
         kind: Collection,
-        name: &str,
+        key: &str,
         value: Vec<u8>,
         blocked: &mut bool,
     ) -> Result<Row> {
@@ -542,12 +820,21 @@ impl Engine {
                 database.id = id;
                 database.encode_to_vec()
             }
+            Collection::Formats => {
+                let mut format = Format::decode(value.as_slice())?;
+                format.id = id;
+                format.encode_to_vec()
+            }
+            Collection::Streams => {
+                let mut stream = Stream::decode(value.as_slice())?;
+                stream.id = id;
+                stream.encode_to_vec()
+            }
         };
-        let key = kind.key(name)?;
         *blocked = true;
         match self
             .store
-            .put(&key, value.clone(), Condition::Missing, None)
+            .put(key, value.clone(), Condition::Missing, None)
             .await
         {
             Ok(row) => {
@@ -558,7 +845,7 @@ impl Engine {
                 *blocked = false;
                 Err(MetadataError::AlreadyExists)
             }
-            Err(_) => match self.store.get(&key).await {
+            Err(_) => match self.store.get(key).await {
                 Ok(Some(row)) if row.value == value => {
                     self.metrics.reconciled("create");
                     *blocked = false;
@@ -700,6 +987,84 @@ fn decode_database(row: &Row) -> Result<MetadataRecord<Database>> {
         MetadataVersion::new(row.version),
     ))
 }
+
+fn validate_format(format: &Format) -> Result<()> {
+    if format.database_id == 0 {
+        return Err(MetadataError::InvalidRecord("zero format database"));
+    }
+    validate_name(&format.name)?;
+    FormatType::try_from(format.format_type)
+        .map_err(|_| MetadataError::InvalidRecord("unknown format type"))?;
+    if format.definition.is_empty() {
+        return Err(MetadataError::InvalidRecord("format definition is empty"));
+    }
+    Ok(())
+}
+
+fn decode_format(row: &Row) -> Result<MetadataRecord<Format>> {
+    let format = Format::decode(row.value.as_slice())?;
+    validate_format(&format)?;
+    let id = format.id;
+    if id == 0 || row.key != format_key(format.database_id, &format.name)? {
+        return Err(MetadataError::Integrity("format key or ID mismatch"));
+    }
+    Ok(MetadataRecord::new(
+        id,
+        format,
+        MetadataVersion::new(row.version),
+    ))
+}
+
+fn validate_stream(stream: &Stream) -> Result<()> {
+    if stream.database_id == 0 {
+        return Err(MetadataError::InvalidRecord("zero stream database"));
+    }
+    validate_name(&stream.schema_name)?;
+    validate_name(&stream.name)?;
+    if let Some(format_name) = &stream.format_name {
+        validate_name(format_name)?;
+    }
+    if stream.effective_replication() == 0 {
+        return Err(MetadataError::InvalidRecord(
+            "stream replication must be positive",
+        ));
+    }
+    let mut previous_start = None;
+    for fragment in &stream.fragments {
+        validate_fragment(fragment)?;
+        if previous_start.is_some_and(|previous| fragment.start_offset <= previous) {
+            return Err(MetadataError::InvalidRecord(
+                "stream fragments must be ordered by increasing start offset",
+            ));
+        }
+        previous_start = Some(fragment.start_offset);
+    }
+    Ok(())
+}
+
+fn validate_fragment(fragment: &StreamFragment) -> Result<()> {
+    if fragment.owners.is_empty() || fragment.owners.iter().any(|owner| owner.is_empty()) {
+        return Err(MetadataError::InvalidRecord(
+            "fragment must have at least one non-empty owner",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_stream(row: &Row) -> Result<MetadataRecord<Stream>> {
+    let stream = Stream::decode(row.value.as_slice())?;
+    validate_stream(&stream)?;
+    let id = stream.id;
+    if id == 0 || row.key != stream_key(stream.database_id, &stream.schema_name, &stream.name)? {
+        return Err(MetadataError::Integrity("stream key or ID mismatch"));
+    }
+    Ok(MetadataRecord::new(
+        id,
+        stream,
+        MetadataVersion::new(row.version),
+    ))
+}
+
 fn decode_user(row: &Row) -> Result<MetadataRecord<User>> {
     let user = User::decode(row.value.as_slice())?;
     validate_name(&user.name)?;
@@ -835,6 +1200,99 @@ macro_rules! metadata_impl {
                 self.engine
                     .metrics
                     .observe("delete", self.engine.delete_database(id, version))
+                    .await
+            }
+            async fn get_format(
+                &self,
+                database_id: u32,
+                name: &str,
+            ) -> Result<Option<MetadataRecord<Format>>> {
+                self.engine
+                    .metrics
+                    .observe(
+                        "get",
+                        self.engine.read(self.engine.get_format(database_id, name)),
+                    )
+                    .await
+            }
+            async fn get_format_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Format>>> {
+                self.engine
+                    .metrics
+                    .observe("get", self.engine.read(self.engine.get_format_by_id(id)))
+                    .await
+            }
+            async fn list_formats(&self, database_id: u32) -> Result<Vec<MetadataRecord<Format>>> {
+                self.engine
+                    .metrics
+                    .observe(
+                        "list",
+                        self.engine.read(self.engine.list_formats(database_id)),
+                    )
+                    .await
+            }
+            async fn create_format(&self, format: Format) -> Result<MetadataRecord<Format>> {
+                self.engine
+                    .metrics
+                    .observe("create", self.engine.create_format(format))
+                    .await
+            }
+            async fn delete_format(&self, id: u32, version: MetadataVersion) -> Result<()> {
+                self.engine
+                    .metrics
+                    .observe("delete", self.engine.delete_format(id, version))
+                    .await
+            }
+            async fn get_stream(
+                &self,
+                database_id: u32,
+                schema_name: &str,
+                name: &str,
+            ) -> Result<Option<MetadataRecord<Stream>>> {
+                self.engine
+                    .metrics
+                    .observe(
+                        "get",
+                        self.engine
+                            .read(self.engine.get_stream(database_id, schema_name, name)),
+                    )
+                    .await
+            }
+            async fn get_stream_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Stream>>> {
+                self.engine
+                    .metrics
+                    .observe("get", self.engine.read(self.engine.get_stream_by_id(id)))
+                    .await
+            }
+            async fn list_streams(&self, database_id: u32) -> Result<Vec<MetadataRecord<Stream>>> {
+                self.engine
+                    .metrics
+                    .observe(
+                        "list",
+                        self.engine.read(self.engine.list_streams(database_id)),
+                    )
+                    .await
+            }
+            async fn create_stream(&self, stream: Stream) -> Result<MetadataRecord<Stream>> {
+                self.engine
+                    .metrics
+                    .observe("create", self.engine.create_stream(stream))
+                    .await
+            }
+            async fn update_stream(
+                &self,
+                id: u32,
+                stream: Stream,
+                version: MetadataVersion,
+            ) -> Result<MetadataRecord<Stream>> {
+                self.engine
+                    .metrics
+                    .observe("update", self.engine.update_stream(id, stream, version))
+                    .await
+            }
+            async fn delete_stream(&self, id: u32, version: MetadataVersion) -> Result<()> {
+                self.engine
+                    .metrics
+                    .observe("delete", self.engine.delete_stream(id, version))
                     .await
             }
             async fn register_component(

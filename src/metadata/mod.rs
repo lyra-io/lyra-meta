@@ -3,6 +3,8 @@ mod engine;
 mod error;
 #[cfg(test)]
 mod fault_tests;
+#[cfg(test)]
+mod format_stream_tests;
 mod keys;
 mod memory;
 pub mod oxia;

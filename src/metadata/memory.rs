@@ -7,7 +7,9 @@ use super::{
     ComponentIdentity, Metadata, MetadataError, MetadataRecord, MetadataVersion,
     RegisteredComponent, Registration, Result, UserInfo,
 };
-use crate::proto::pb_meta::{ComponentRegistration, Database, Instance, ScramSha256Verifier};
+use crate::proto::pb_meta::{
+    ComponentRegistration, Database, Format, Instance, ScramSha256Verifier, Stream,
+};
 use async_trait::async_trait;
 use opentelemetry::metrics::Meter;
 use prost::Message;
