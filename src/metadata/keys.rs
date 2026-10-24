@@ -9,6 +9,8 @@ pub(crate) const PARTITION: &str = "catalog";
 pub(crate) enum Collection {
     Users,
     Databases,
+    Formats,
+    Streams,
 }
 
 impl Collection {
@@ -16,6 +18,8 @@ impl Collection {
         match self {
             Self::Users => "/catalog/users/",
             Self::Databases => "/catalog/databases/",
+            Self::Formats => "/catalog/formats/",
+            Self::Streams => "/catalog/streams/",
         }
     }
 
@@ -23,6 +27,8 @@ impl Collection {
         match self {
             Self::Users => "/catalog/allocator/user",
             Self::Databases => "/catalog/allocator/database",
+            Self::Formats => "/catalog/allocator/format",
+            Self::Streams => "/catalog/allocator/stream",
         }
     }
 
