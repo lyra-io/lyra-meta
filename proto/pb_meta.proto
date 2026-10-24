@@ -31,6 +31,41 @@ message User {
   uint32 id = 3;
 }
 
+// /catalog/formats/<hex-encoded UTF-8 canonical name> (partition: catalog).
+// The definition is an opaque, user-supplied string; the format type tells the
+// client how to interpret it. Lyra never parses the definition.
+message Format {
+  string name = 1;
+  FormatType format_type = 2;
+  bytes definition = 3;
+  uint32 id = 4;
+}
+
+enum FormatType {
+  AVRO = 0;
+  PROTOBUF = 1;
+  JSON = 2;
+}
+
+// /catalog/streams/<hex-encoded UTF-8 canonical name> (partition: catalog).
+// A stream is a single ordered log of opaque bytes. `format_name` is optional;
+// when absent the stream is raw. Replication is absent means the default (2).
+message Stream {
+  string name = 1;
+  optional string format_name = 2;
+  optional uint32 replication = 3;
+  uint32 id = 4;
+  repeated StreamFragment fragments = 5;
+}
+
+// A logical, node-reported slice of a stream's ordered log. The node records a
+// fragment when ownership of an offset range moves between servers.
+message StreamFragment {
+  uint64 fragment_id = 1;
+  uint64 start_offset = 2;
+  repeated string owners = 3;
+}
+
 // /catalog/allocator/database or /catalog/allocator/user (partition: catalog).
 // Durable high-water mark, advanced with version CAS; never deleted or reset.
 message Allocator {
