@@ -189,7 +189,27 @@ impl Engine {
 
     pub(crate) async fn validate_initialized(&self) -> Result<()> {
         self.ready0().await?;
+        self.ensure_collection_allocators0().await?;
         self.inventory0().await
+    }
+
+    /// Creates any missing per-collection allocators for metadata initialized
+    /// before those collections existed. Idempotent and safe to run at every
+    /// startup.
+    async fn ensure_collection_allocators0(&self) -> Result<()> {
+        for kind in [Collection::Formats, Collection::Streams] {
+            if self.store.get(kind.allocator()).await?.is_none() {
+                self.store
+                    .put(
+                        kind.allocator(),
+                        Allocator { last_allocated: 0 }.encode_to_vec(),
+                        Condition::Missing,
+                        None,
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn inventory0(&self) -> Result<()> {
