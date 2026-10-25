@@ -667,12 +667,11 @@ impl Engine {
     pub(crate) async fn get_stream(
         &self,
         database_id: u32,
-        schema_name: &str,
         name: &str,
     ) -> Result<Option<MetadataRecord<Stream>>> {
         let record = self
             .store
-            .get(&stream_key(database_id, schema_name, name)?)
+            .get(&stream_key(database_id, name)?)
             .await?
             .as_ref()
             .map(decode_stream)
@@ -731,7 +730,7 @@ impl Engine {
         self.ready0().await?;
         self.stream_format0(&stream).await?;
         if self
-            .get_stream(stream.database_id, &stream.schema_name, &stream.name)
+            .get_stream(stream.database_id, &stream.name)
             .await?
             .is_some()
         {
@@ -740,7 +739,7 @@ impl Engine {
         let row = self
             .allocate0(
                 Collection::Streams,
-                &stream_key(stream.database_id, &stream.schema_name, &stream.name)?,
+                &stream_key(stream.database_id, &stream.name)?,
                 stream.encode_to_vec(),
                 &mut blocked,
             )
@@ -769,15 +768,16 @@ impl Engine {
         }
         if stream.id != id
             || stream.database_id != old.value().database_id
-            || stream.schema_name != old.value().schema_name
             || stream.name != old.value().name
         {
-            return Err(MetadataError::InvalidRecord("stream identity is immutable"));
+            return Err(MetadataError::InvalidRecord(
+                "stream ID, database, and name are immutable",
+            ));
         }
         self.stream_format0(&stream).await?;
         let row = self
             .put0(
-                &stream_key(stream.database_id, &stream.schema_name, &stream.name)?,
+                &stream_key(stream.database_id, &stream.name)?,
                 stream.encode_to_vec(),
                 version.value(),
                 None,
@@ -798,11 +798,7 @@ impl Engine {
             .await?
             .ok_or(MetadataError::NotFound)?;
         self.delete0(
-            &stream_key(
-                old.value().database_id,
-                &old.value().schema_name,
-                &old.value().name,
-            )?,
+            &stream_key(old.value().database_id, &old.value().name)?,
             version.value(),
             &mut blocked,
         )
@@ -1075,7 +1071,7 @@ fn decode_stream(row: &Row) -> Result<MetadataRecord<Stream>> {
     let stream = Stream::decode(row.value.as_slice())?;
     validate_stream(&stream)?;
     let id = stream.id;
-    if id == 0 || row.key != stream_key(stream.database_id, &stream.schema_name, &stream.name)? {
+    if id == 0 || row.key != stream_key(stream.database_id, &stream.name)? {
         return Err(MetadataError::Integrity("stream key or ID mismatch"));
     }
     Ok(MetadataRecord::new(
@@ -1265,15 +1261,13 @@ macro_rules! metadata_impl {
             async fn get_stream(
                 &self,
                 database_id: u32,
-                schema_name: &str,
                 name: &str,
             ) -> Result<Option<MetadataRecord<Stream>>> {
                 self.engine
                     .metrics
                     .observe(
                         "get",
-                        self.engine
-                            .read(self.engine.get_stream(database_id, schema_name, name)),
+                        self.engine.read(self.engine.get_stream(database_id, name)),
                     )
                     .await
             }
