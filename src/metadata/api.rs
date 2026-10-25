@@ -90,7 +90,6 @@ pub trait Metadata: Send + Sync {
     async fn get_stream(
         &self,
         database_id: u32,
-        schema_name: &str,
         name: &str,
     ) -> Result<Option<MetadataRecord<Stream>>>;
     async fn get_stream_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Stream>>>;

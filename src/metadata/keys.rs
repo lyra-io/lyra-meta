@@ -67,18 +67,11 @@ pub(crate) fn format_key(database_id: u32, name: &str) -> Result<String> {
     Ok(key)
 }
 
-/// `/catalog/streams/<database-id>/<hex schema>/<hex name>`.
-pub(crate) fn stream_key(database_id: u32, schema: &str, name: &str) -> Result<String> {
-    validate_name(schema)?;
+/// `/catalog/streams/<database-id>/<hex name>`. The schema lives in the value.
+pub(crate) fn stream_key(database_id: u32, name: &str) -> Result<String> {
     validate_name(name)?;
-    let mut key = String::with_capacity(
-        Collection::Streams.prefix().len() + (schema.len() + name.len()) * 2 + 24,
-    );
+    let mut key = String::with_capacity(Collection::Streams.prefix().len() + name.len() * 2 + 16);
     write!(&mut key, "{}{database_id}/", Collection::Streams.prefix()).unwrap();
-    for byte in schema.bytes() {
-        write!(&mut key, "{byte:02x}").unwrap();
-    }
-    key.push('/');
     for byte in name.bytes() {
         write!(&mut key, "{byte:02x}").unwrap();
     }
