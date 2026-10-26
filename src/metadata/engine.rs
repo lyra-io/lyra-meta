@@ -664,6 +664,45 @@ impl Engine {
         .await
     }
 
+    pub(crate) async fn update_format(
+        &self,
+        id: u32,
+        format: Format,
+        version: MetadataVersion,
+    ) -> Result<MetadataRecord<Format>> {
+        validate_format(&format)?;
+        let mut blocked = self.mutations.lock().await;
+        if *blocked {
+            return Err(MetadataError::UncertainWrite);
+        }
+        self.ready0().await?;
+        let old = self
+            .get_format_by_id(id)
+            .await?
+            .ok_or(MetadataError::NotFound)?;
+        if old.version() != version {
+            return Err(MetadataError::Conflict("format version".into()));
+        }
+        if format.id != id
+            || format.database_id != old.value().database_id
+            || format.name != old.value().name
+        {
+            return Err(MetadataError::InvalidRecord(
+                "format ID, database, and name are immutable",
+            ));
+        }
+        let row = self
+            .put0(
+                &format_key(format.database_id, &format.name)?,
+                format.encode_to_vec(),
+                version.value(),
+                None,
+                &mut blocked,
+            )
+            .await?;
+        decode_format(&row)
+    }
+
     pub(crate) async fn get_stream(
         &self,
         database_id: u32,
@@ -1256,6 +1295,17 @@ macro_rules! metadata_impl {
                 self.engine
                     .metrics
                     .observe("delete", self.engine.delete_format(id, version))
+                    .await
+            }
+            async fn update_format(
+                &self,
+                id: u32,
+                format: Format,
+                version: MetadataVersion,
+            ) -> Result<MetadataRecord<Format>> {
+                self.engine
+                    .metrics
+                    .observe("update", self.engine.update_format(id, format, version))
                     .await
             }
             async fn get_stream(
