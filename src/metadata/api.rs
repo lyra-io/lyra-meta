@@ -85,6 +85,12 @@ pub trait Metadata: Send + Sync {
     async fn get_format_by_id(&self, id: u32) -> Result<Option<MetadataRecord<Format>>>;
     async fn list_formats(&self, database_id: u32) -> Result<Vec<MetadataRecord<Format>>>;
     async fn create_format(&self, format: Format) -> Result<MetadataRecord<Format>>;
+    async fn update_format(
+        &self,
+        id: u32,
+        format: Format,
+        version: MetadataVersion,
+    ) -> Result<MetadataRecord<Format>>;
     async fn delete_format(&self, id: u32, version: MetadataVersion) -> Result<()>;
 
     async fn get_stream(
