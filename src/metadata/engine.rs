@@ -646,14 +646,19 @@ impl Engine {
         decode_format(&row)
     }
 
-    pub(crate) async fn delete_format(&self, id: u32, version: MetadataVersion) -> Result<()> {
+    pub(crate) async fn delete_format(
+        &self,
+        database_id: u32,
+        name: &str,
+        version: MetadataVersion,
+    ) -> Result<()> {
         let mut blocked = self.mutations.lock().await;
         if *blocked {
             return Err(MetadataError::UncertainWrite);
         }
         self.ready0().await?;
         let old = self
-            .get_format_by_id(id)
+            .get_format(database_id, name)
             .await?
             .ok_or(MetadataError::NotFound)?;
         self.delete0(
@@ -677,7 +682,7 @@ impl Engine {
         }
         self.ready0().await?;
         let old = self
-            .get_format_by_id(id)
+            .get_format(format.database_id, &format.name)
             .await?
             .ok_or(MetadataError::NotFound)?;
         if old.version() != version {
@@ -799,7 +804,7 @@ impl Engine {
         }
         self.ready0().await?;
         let old = self
-            .get_stream_by_id(id)
+            .get_stream(stream.database_id, &stream.name)
             .await?
             .ok_or(MetadataError::NotFound)?;
         if old.version() != version {
@@ -826,14 +831,19 @@ impl Engine {
         decode_stream(&row)
     }
 
-    pub(crate) async fn delete_stream(&self, id: u32, version: MetadataVersion) -> Result<()> {
+    pub(crate) async fn delete_stream(
+        &self,
+        database_id: u32,
+        name: &str,
+        version: MetadataVersion,
+    ) -> Result<()> {
         let mut blocked = self.mutations.lock().await;
         if *blocked {
             return Err(MetadataError::UncertainWrite);
         }
         self.ready0().await?;
         let old = self
-            .get_stream_by_id(id)
+            .get_stream(database_id, name)
             .await?
             .ok_or(MetadataError::NotFound)?;
         self.delete0(
@@ -1291,10 +1301,18 @@ macro_rules! metadata_impl {
                     .observe("create", self.engine.create_format(format))
                     .await
             }
-            async fn delete_format(&self, id: u32, version: MetadataVersion) -> Result<()> {
+            async fn delete_format(
+                &self,
+                database_id: u32,
+                name: &str,
+                version: MetadataVersion,
+            ) -> Result<()> {
                 self.engine
                     .metrics
-                    .observe("delete", self.engine.delete_format(id, version))
+                    .observe(
+                        "delete",
+                        self.engine.delete_format(database_id, name, version),
+                    )
                     .await
             }
             async fn update_format(
@@ -1353,10 +1371,18 @@ macro_rules! metadata_impl {
                     .observe("update", self.engine.update_stream(id, stream, version))
                     .await
             }
-            async fn delete_stream(&self, id: u32, version: MetadataVersion) -> Result<()> {
+            async fn delete_stream(
+                &self,
+                database_id: u32,
+                name: &str,
+                version: MetadataVersion,
+            ) -> Result<()> {
                 self.engine
                     .metrics
-                    .observe("delete", self.engine.delete_stream(id, version))
+                    .observe(
+                        "delete",
+                        self.engine.delete_stream(database_id, name, version),
+                    )
                     .await
             }
             async fn register_component(
