@@ -91,7 +91,12 @@ pub trait Metadata: Send + Sync {
         format: Format,
         version: MetadataVersion,
     ) -> Result<MetadataRecord<Format>>;
-    async fn delete_format(&self, id: u32, version: MetadataVersion) -> Result<()>;
+    async fn delete_format(
+        &self,
+        database_id: u32,
+        name: &str,
+        version: MetadataVersion,
+    ) -> Result<()>;
 
     async fn get_stream(
         &self,
@@ -107,7 +112,12 @@ pub trait Metadata: Send + Sync {
         stream: Stream,
         version: MetadataVersion,
     ) -> Result<MetadataRecord<Stream>>;
-    async fn delete_stream(&self, id: u32, version: MetadataVersion) -> Result<()>;
+    async fn delete_stream(
+        &self,
+        database_id: u32,
+        name: &str,
+        version: MetadataVersion,
+    ) -> Result<()>;
 
     async fn register_component(
         &self,
